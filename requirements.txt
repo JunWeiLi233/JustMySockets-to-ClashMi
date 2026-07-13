@@ -1,0 +1,15 @@
+# Runtime dependencies for subscription-converter.
+#
+# Install everything needed to run the service:
+#     pip install -r requirements.txt
+#
+# For development (adds test + lint + type-check tooling):
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# These pins mirror pyproject.toml [project].dependencies.
+
+fastapi>=0.115,<0.120
+uvicorn[standard]>=0.34,<0.40
+httpx>=0.27,<0.30
+pydantic>=2.9,<3.0
+PyYAML>=6.0,<7.0
