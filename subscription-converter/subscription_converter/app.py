@@ -24,13 +24,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Final
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, FastAPI, Query, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
 
 from subscription_converter.cache import TTLCache
@@ -45,6 +46,10 @@ from subscription_converter.subscription_parser import (
     SubscriptionFetchError,
     SubscriptionParseError,
     SubscriptionParser,
+)
+from subscription_converter.url_input import (
+    InvalidSubscriptionURL,
+    normalize_subscription_url,
 )
 
 __all__ = ["AppState", "app", "create_app"]
@@ -300,11 +305,29 @@ async def health(request: Request) -> dict[str, object]:
     return {"status": "ok", "cache_size": state.cache.size()}
 
 
-async def _convert_endpoint(request: Request, url: str, fmt: str, force_refresh: bool) -> Response:
+async def _convert_endpoint(
+    request: Request, fmt: str, *, allow_force_refresh: bool = True
+) -> Response:
+    """Shared handler for all conversion endpoints.
+
+    The user's subscription URL is read from the **raw query string** (not the
+    FastAPI ``url`` query param) so that unencoded ``?``/``&`` characters in a
+    pasted URL are preserved. The raw value is then run through
+    :func:`normalize_subscription_url`, which forgives stray backslashes,
+    leading ``%20`` spaces, and accidental double-encoding. This means users
+    can paste any of these and still get a working conversion:
+
+    - ``?url=https://x.net/s?service=1&id=2``  (unencoded, raw paste)
+    - ``?url=https%3A%2F%2Fx.net%2Fs%3Fservice%3D1%26id%3D2``  (pre-encoded)
+    - ``?url=https://x.net/s\\?service\\=1\\&id=2``  (shell-escaped)
+    """
     state = _state(request)
+    raw_url, force_refresh = _extract_url_and_refresh(request, allow_force_refresh)
+
     try:
+        url = normalize_subscription_url(raw_url)
         _validate_url(url, state.settings)
-    except ValueError as exc:
+    except (ValueError, InvalidSubscriptionURL) as exc:
         return PlainTextResponse(f"invalid request: {exc}", status_code=400)
 
     try:
@@ -335,36 +358,74 @@ async def _convert_endpoint(request: Request, url: str, fmt: str, force_refresh:
     return Response(content=rendered, media_type=media_type, headers=headers)
 
 
+def _extract_url_and_refresh(request: Request, allow_force_refresh: bool) -> tuple[str, bool]:
+    """Pull the raw ``url=`` value and optional ``force_refresh`` from the query.
+
+    Reads the raw query string so a pasted URL containing unencoded ``&`` (which
+    FastAPI would otherwise split into separate params) is reconstructed in
+    full. The ``force_refresh`` flag is detected conservatively.
+    """
+    raw_qs = request.url.query or ""
+    # Split on '&' only where it separates a key=val pair that is NOT part of
+    # the user's URL. We treat the first 'url=' as the start; everything after
+    # it up to the trailing '&force_refresh=...' belongs to the subscription URL.
+    # Strategy: find 'url=' (case-insensitive), capture the rest, then peel off
+    # a trailing '&force_refresh=true|1|yes' if present.
+    idx = _find_url_key(raw_qs)
+    if idx is None:
+        return "", False
+    value = raw_qs[idx + len("url=") :]
+    force = False
+    m = _TRAILING_FORCE_REFRESH.search(value)
+    if m and allow_force_refresh:
+        force = _as_bool(m.group(1))
+        value = value[: m.start()].rstrip("&")
+    # The captured value is still percent-encoded at the transport layer
+    # (urlencoded query string). We decode known-safe chars here so the
+    # downstream normalizer sees a readable value; further decoding logic lives
+    # in normalize_subscription_url.
+    from urllib.parse import unquote
+
+    return unquote(value), force
+
+
+def _find_url_key(qs: str) -> int | None:
+    """Return the index of the ``url=`` key in the raw query string.
+
+    Matches ``url=`` at the start, or after an ``&``. Case-insensitive.
+    """
+    lowered = qs.lower()
+    if lowered.startswith("url="):
+        return 0
+    pos = lowered.find("&url=")
+    if pos >= 0:
+        return pos + 1
+    return None
+
+
+def _as_bool(v: str) -> bool:
+    return v.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_TRAILING_FORCE_REFRESH = re.compile(r"(?:^|&)force_refresh=([^&]+)$", re.IGNORECASE)
+
+
 @router.get("/clash")
-async def clash(
-    request: Request,
-    url: str = Query(default="", description="Subscription URL"),
-    force_refresh: bool = Query(
-        default=False, description="Bypass cache and re-download the upstream now."
-    ),
-) -> Response:
+async def clash(request: Request) -> Response:
     """Mihomo / Clash Meta compatible YAML endpoint."""
-    return await _convert_endpoint(request, url, "clash", force_refresh)
+    return await _convert_endpoint(request, "clash")
 
 
 @router.get("/surge")
-async def surge(
-    request: Request,
-    url: str = Query(default="", description="Subscription URL"),
-    force_refresh: bool = Query(default=False, description="Bypass cache."),
-) -> Response:
+async def surge(request: Request) -> Response:
     """Surge config (placeholder renderer; same parser)."""
-    return await _convert_endpoint(request, url, "surge", force_refresh)
+    return await _convert_endpoint(request, "surge")
 
 
 @router.get("/sing-box")
-async def sing_box(
-    request: Request,
-    url: str = Query(default="", description="Subscription URL"),
-    force_refresh: bool = Query(default=False, description="Bypass cache."),
-) -> Response:
+async def sing_box(request: Request) -> Response:
     """sing-box JSON config (placeholder renderer; same parser)."""
-    return await _convert_endpoint(request, url, "sing-box", force_refresh)
+    return await _convert_endpoint(request, "sing-box")
 
 
 # --------------------------------------------------------------------------- #
