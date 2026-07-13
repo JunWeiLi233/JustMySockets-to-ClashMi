@@ -43,11 +43,11 @@ Issues = "https://github.com/JunWeiLi233/JustMySockets-to-ClashMi/issues"
 
 # ---------------------------------------------------------------------------
 # setuptools: the importable package `subscription_converter` lives under
-# `subscription-converter/` (which acts as a src root).
+# `subscription-converter/` (which acts as a src root). All sub-packages
+# (converters, parsers) are discovered automatically.
 # ---------------------------------------------------------------------------
 [tool.setuptools]
-packages = ["subscription_converter"]
-package-dir = { "" = "subscription-converter" }
+packages = { find = { where = ["subscription-converter"] } }
 
 # ---------------------------------------------------------------------------
 # Ruff: formatter + linter

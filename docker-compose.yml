@@ -1,0 +1,34 @@
+services:
+  converter:
+    build: .
+    image: subscription-converter:latest
+    container_name: subscription-converter
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      WORKERS: "2"
+      # How often the upstream subscription is re-downloaded (seconds).
+      # The generated YAML always reflects the latest cached upstream payload.
+      CACHE_TTL_SECONDS: "300"
+      CACHE_MAX_ENTRIES: "512"
+      FETCH_TIMEOUT_SECONDS: "15"
+      TEST_URL: "https://www.gstatic.com/generate_204"
+      TEST_INTERVAL: "300"
+      LOG_LEVEL: "INFO"
+      # DNS resolvers (PUBLIC recursive resolvers, never proxy servers).
+      DNS_NAMESERVER: "https://dns.alidns.com/dns-query,https://doh.pub/dns-query"
+      DNS_FALLBACK: "https://1.1.1.1/dns-query,https://dns.google/dns-query"
+      DNS_BOOTSTRAP: "223.5.5.5,119.29.29.29"
+      DNS_FAKE_IP_RANGE: "198.18.0.1/16"
+      DNS_IPV6: "false"
+      # Optional allow-list of upstream subscription hostnames (comma separated).
+      # ALLOWED_HOSTS: "jmssub.net,example.com"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','8000')).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
