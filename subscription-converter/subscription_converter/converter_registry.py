@@ -11,12 +11,16 @@ from typing import Any
 
 from subscription_converter.converters import BaseConverter, ConversionError
 from subscription_converter.converters.mihomo import MihomoConverter
+from subscription_converter.converters.singbox import SingBoxConverter
+from subscription_converter.converters.surge import SurgeConverter
 
 __all__ = ["CONVERTERS", "get_converter"]
 
 CONVERTERS: dict[str, type[BaseConverter]] = {
     "clash": MihomoConverter,
     "mihomo": MihomoConverter,
+    "surge": SurgeConverter,
+    "sing-box": SingBoxConverter,
 }
 
 
