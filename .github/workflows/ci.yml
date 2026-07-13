@@ -76,3 +76,23 @@ jobs:
           python-version: "3.12"
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.1
+
+  docker-build:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the production image
+        # Confirms the Dockerfile builds and the service starts + becomes healthy.
+        run: |
+          docker build -t subscription-converter:ci .
+          docker run -d --name sc-ci -p 8000:8000 subscription-converter:ci
+          # Wait for health (the image has a HEALTHCHECK).
+          for i in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' sc-ci 2>/dev/null || echo "starting")
+            echo "health=$status"
+            [ "$status" = "healthy" ] && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/health
+          docker rm -f sc-ci
