@@ -37,7 +37,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Non-root user for defence in depth.
 RUN groupadd --system --gid 1001 app \
- && useradd --system --uid 1001 --gid app --create-home --home-dir /home/app app
+ && useradd --system --uid 1001 --gid app --create-home --home-dir /home/app app \
+ && mkdir -p /var/data \
+ && chown app:app /var/data \
+ && chmod 700 /var/data
 
 COPY --from=builder /opt/venv /opt/venv
 

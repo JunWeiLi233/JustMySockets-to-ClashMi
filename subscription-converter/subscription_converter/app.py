@@ -5,6 +5,9 @@ Endpoints
 * ``GET /``           -> private browser UI for building client URLs
 * ``GET /health``     -> JSON health + cache size
 * ``POST /api/check`` -> private same-origin subscription validation
+* ``POST /api/links`` -> encrypted durable link creation
+* ``POST /api/links/close`` -> permanent closure by private management key
+* ``GET /s/{token}``  -> config through an opaque durable access token
 * ``GET /clash``      -> Mihomo / Clash Meta YAML (``application/yaml``)
 * ``GET /surge``      -> Surge config (placeholder renderer, same pipeline)
 * ``GET /sing-box``   -> sing-box JSON (placeholder renderer, same pipeline)
@@ -16,8 +19,8 @@ immediately.
 Security
 --------
 The subscription URL (and any credentials embedded in it) is never logged. A
-process-wide logging filter redacts any ``url=...`` value, and the cache stores
-only HMAC digests of URLs.
+process-wide logging filter redacts URL and opaque-token shapes. Durable source
+URLs use authenticated encryption; cache and database lookups use HMAC digests.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from functools import lru_cache
 from typing import Final, Literal
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
@@ -42,6 +46,13 @@ from subscription_converter.converter_registry import get_converter
 from subscription_converter.converters import BaseConverter, ConversionError
 from subscription_converter.converters.mihomo import MihomoConverter
 from subscription_converter.frontend import render_frontend
+from subscription_converter.link_store import (
+    CapacityReached,
+    DuplicateSourceLimitReached,
+    LinkStore,
+    LinkStoreConfigurationError,
+    LinkStoreCorruptionError,
+)
 from subscription_converter.models import Subscription
 from subscription_converter.network_guard import SSRFError, UrlValidator, default_url_validator
 from subscription_converter.parser_port import ParserRegistry
@@ -80,16 +91,18 @@ _PERMISSIONS_POLICY: Final[str] = (
 class _MaskingFilter(logging.Filter):
     """Redact subscription URLs and credentials from every log record.
 
-    Catches three leak shapes:
+    Catches four leak shapes:
     1. ``url=<value>`` tokens (our own structured logs).
     2. Bare ``https?://...`` URLs anywhere (httpx DEBUG request logs, exception
        messages that embed the upstream URL).
     3. ``<secret-key>=<value>`` tokens for credential-ish keys
        (token / password / secret / key / auth / uuid / sid / id).
+    4. Opaque access tokens in ``/s/<token>`` request paths.
     """
 
     _URL_RE = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
     _SECRET_RE = re.compile(r"(?i)(token|password|passwd|secret|key|auth|uuid|sid|id)=\S+")
+    _STABLE_PATH_RE = re.compile(r"(?i)(/s/)[A-Za-z0-9_-]{32,128}")
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -105,6 +118,7 @@ class _MaskingFilter(logging.Filter):
     def _redact(self, text: str) -> str:
         text = self._URL_RE.sub("<redacted-url>", text)
         text = self._SECRET_RE.sub(lambda m: m.group(1) + "=<redacted>", text)
+        text = self._STABLE_PATH_RE.sub(r"\1<redacted-token>", text)
         return text
 
 
@@ -167,6 +181,34 @@ class AppState:
             ttl_seconds=settings.cache_ttl_seconds,
             max_entries=settings.cache_max_entries,
         )
+        self.link_store: LinkStore | None = None
+        if settings.persistent_links_enabled:
+            self._validate_public_base_url(settings.public_base_url)
+            self.link_store = LinkStore(
+                settings.link_database_path,
+                settings.link_secret_key,
+                max_active_links=settings.max_active_links,
+                max_links_per_source=settings.max_links_per_source,
+            )
+
+    @staticmethod
+    def _validate_public_base_url(value: str) -> None:
+        parsed = urlsplit(value)
+        local_http = parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}
+        if not parsed.netloc or (parsed.scheme != "https" and not local_http):
+            raise LinkStoreConfigurationError(
+                "PUBLIC_BASE_URL must be an absolute HTTPS URL (or local HTTP URL)"
+            )
+        if (
+            parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+            or parsed.password
+        ):
+            raise LinkStoreConfigurationError(
+                "PUBLIC_BASE_URL must be an origin without credentials, path, or query"
+            )
 
     def make_converter(self, fmt: str) -> BaseConverter:
         if fmt in {"clash", "mihomo"}:
@@ -221,6 +263,23 @@ class _CheckRequest(BaseModel):
     url: str = Field(min_length=1, max_length=4096)
     format: Literal["clash", "sing-box", "surge"] = "clash"
     force_refresh: bool = False
+
+
+class _CreateLinkRequest(BaseModel):
+    """Strict body for creating one durable subscription link."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    url: str = Field(min_length=1, max_length=4096)
+    format: Literal["clash", "sing-box", "surge"] = "clash"
+
+
+class _CloseLinkRequest(BaseModel):
+    """Management key submitted in a body so it never enters URL logs/history."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    manage_key: str = Field(min_length=1, max_length=128)
 
 
 # --------------------------------------------------------------------------- #
@@ -394,7 +453,21 @@ async def root() -> HTMLResponse:
 @router.get("/health")
 async def health(request: Request) -> dict[str, object]:
     state = _state(request)
-    return {"status": "ok", "cache_size": state.cache.size()}
+    payload: dict[str, object] = {
+        "status": "ok",
+        "cache_size": state.cache.size(),
+        "persistent_links": "disabled",
+    }
+    if state.link_store is not None:
+        capacity = await asyncio.to_thread(state.link_store.capacity)
+        payload.update(
+            {
+                "persistent_links": "ready",
+                "active_links": capacity.active,
+                "link_capacity": capacity.limit,
+            }
+        )
+    return payload
 
 
 def _check_error(message: str, *, status_code: int = 400) -> JSONResponse:
@@ -405,10 +478,31 @@ def _check_error(message: str, *, status_code: int = 400) -> JSONResponse:
     )
 
 
+def _api_error(
+    code: str,
+    message: str,
+    *,
+    status_code: int,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    response_headers = {"Cache-Control": _NO_STORE, "Pragma": "no-cache"}
+    if headers:
+        response_headers.update(headers)
+    return JSONResponse(
+        {"status": "error", "code": code, "message": message},
+        status_code=status_code,
+        headers=response_headers,
+    )
+
+
+def _is_cross_site_browser(request: Request) -> bool:
+    return request.headers.get("sec-fetch-site", "").lower() == "cross-site"
+
+
 @router.post("/api/check")
 async def check_subscription(request: Request, payload: _CheckRequest) -> JSONResponse:
     """Validate and render a subscription without placing its URL in request logs."""
-    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+    if _is_cross_site_browser(request):
         return _check_error("cross-site checks are not allowed", status_code=403)
 
     state = _state(request)
@@ -447,6 +541,216 @@ async def check_subscription(request: Request, payload: _CheckRequest) -> JSONRe
     )
 
 
+@router.get("/api/capacity")
+async def link_capacity(request: Request) -> JSONResponse:
+    """Public, non-sensitive availability used by the creation interface."""
+    store = _state(request).link_store
+    if store is None:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "enabled": False,
+                "accepting": False,
+                "active": 0,
+                "limit": 0,
+                "remaining": 0,
+            },
+            headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
+        )
+    capacity = await asyncio.to_thread(store.capacity)
+    return JSONResponse(
+        {
+            "status": "ok",
+            "enabled": True,
+            "accepting": capacity.accepting,
+            "active": capacity.active,
+            "limit": capacity.limit,
+            "remaining": capacity.remaining,
+        },
+        headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
+    )
+
+
+@router.post("/api/links", status_code=201)
+async def create_persistent_link(request: Request, payload: _CreateLinkRequest) -> JSONResponse:
+    """Verify an upstream subscription, then create an encrypted durable link."""
+    if _is_cross_site_browser(request):
+        return _api_error(
+            "cross_site",
+            "cross-site link creation is not allowed",
+            status_code=403,
+        )
+
+    state = _state(request)
+    store = state.link_store
+    if store is None:
+        return _api_error(
+            "not_enabled",
+            "permanent subscription links are not enabled on this server",
+            status_code=503,
+        )
+
+    capacity = await asyncio.to_thread(store.capacity)
+    if not capacity.accepting:
+        return _api_error(
+            "capacity_reached",
+            "new link creation is temporarily closed because all slots are in use",
+            status_code=503,
+            headers={"Retry-After": "3600"},
+        )
+
+    try:
+        url = normalize_subscription_url(payload.url)
+        if not url.lower().startswith("https://"):
+            return _api_error(
+                "https_required",
+                "an HTTPS subscription URL is required",
+                status_code=400,
+            )
+        _validate_url(url, state)
+    except SSRFError:
+        return _api_error("blocked_url", "url rejected: blocked address", status_code=422)
+    except (ValueError, InvalidSubscriptionURL) as exc:
+        return _api_error("invalid_url", f"invalid request: {exc}", status_code=400)
+
+    try:
+        subscription = await asyncio.wait_for(
+            _fetch_subscription(state, url, force_refresh=True),
+            timeout=state.settings.fetch_timeout_seconds + 5,
+        )
+        _render_format(state, payload.format, subscription)
+    except _ConvertHTTPError as exc:
+        return _api_error(
+            "conversion_failed",
+            f"conversion failed: {exc.message}",
+            status_code=400,
+        )
+    except TimeoutError:
+        return _api_error(
+            "upstream_timeout",
+            "conversion failed: upstream fetch timed out",
+            status_code=504,
+        )
+    except Exception as exc:
+        logger.warning("unexpected durable-link check error: %s", exc.__class__.__name__)
+        return _api_error(
+            "conversion_failed",
+            f"conversion failed: unexpected {exc.__class__.__name__}",
+            status_code=400,
+        )
+
+    try:
+        created = await asyncio.to_thread(store.create, url, payload.format)
+    except CapacityReached:
+        return _api_error(
+            "capacity_reached",
+            "new link creation is temporarily closed because all slots are in use",
+            status_code=503,
+            headers={"Retry-After": "3600"},
+        )
+    except DuplicateSourceLimitReached:
+        return _api_error(
+            "source_limit_reached",
+            "this subscription already has the maximum number of permanent links",
+            status_code=409,
+        )
+    except Exception as exc:
+        logger.error("durable link creation failed: %s", exc.__class__.__name__)
+        return _api_error(
+            "storage_unavailable",
+            "permanent link storage is temporarily unavailable",
+            status_code=503,
+        )
+
+    updated_capacity = await asyncio.to_thread(store.capacity)
+    base_url = state.settings.public_base_url
+    return JSONResponse(
+        {
+            "status": "ok",
+            "subscription_url": f"{base_url}/s/{created.access_token}",
+            "manage_key": created.manage_key,
+            "format": payload.format,
+            "nodes": len(subscription.nodes),
+            "created_at": created.created_at,
+            "expires_at": None,
+            "remaining": updated_capacity.remaining,
+        },
+        status_code=201,
+        headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
+    )
+
+
+@router.post("/api/links/close")
+async def close_persistent_link(request: Request, payload: _CloseLinkRequest) -> JSONResponse:
+    """Permanently delete a link; the management key is never put in a URL."""
+    if _is_cross_site_browser(request):
+        return _api_error(
+            "cross_site",
+            "cross-site link closure is not allowed",
+            status_code=403,
+        )
+
+    state = _state(request)
+    store = state.link_store
+    if store is None:
+        return _api_error(
+            "not_enabled",
+            "permanent subscription links are not enabled on this server",
+            status_code=503,
+        )
+    try:
+        closed = await asyncio.to_thread(store.close, payload.manage_key)
+    except Exception as exc:
+        logger.error("durable link close failed: %s", exc.__class__.__name__)
+        return _api_error(
+            "storage_unavailable",
+            "permanent link storage is temporarily unavailable",
+            status_code=503,
+        )
+    if closed is None:
+        return _api_error(
+            "not_found",
+            "management key not found; the link may already be closed",
+            status_code=404,
+        )
+    if closed.source_url is not None:
+        state.cache.invalidate(closed.source_url)
+    return JSONResponse(
+        {"status": "closed", "message": "subscription link permanently closed"},
+        headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
+    )
+
+
+@router.get("/s/{access_token}")
+async def persistent_subscription(request: Request, access_token: str) -> Response:
+    """Resolve one opaque token and dynamically return its current config."""
+    state = _state(request)
+    store = state.link_store
+    if store is None:
+        return PlainTextResponse("subscription link not found", status_code=404)
+    try:
+        stored = await asyncio.to_thread(store.get, access_token)
+    except LinkStoreCorruptionError:
+        logger.error("stored subscription failed authenticated decryption")
+        return PlainTextResponse("subscription link is temporarily unavailable", status_code=503)
+    except Exception as exc:
+        logger.error("durable link read failed: %s", exc.__class__.__name__)
+        return PlainTextResponse("subscription link is temporarily unavailable", status_code=503)
+    if stored is None:
+        return PlainTextResponse("subscription link not found", status_code=404)
+
+    try:
+        _validate_url(stored.source_url, state)
+    except (SSRFError, ValueError):
+        return PlainTextResponse("stored subscription is no longer permitted", status_code=422)
+    return await _convert_validated_url(
+        state,
+        stored.source_url,
+        stored.format,
+        force_refresh=False,
+    )
+
+
 async def _convert_endpoint(
     request: Request, fmt: str, *, allow_force_refresh: bool = True
 ) -> Response:
@@ -464,6 +768,11 @@ async def _convert_endpoint(
     - ``?url=https://x.net/s\\?service\\=1\\&id=2``  (shell-escaped)
     """
     state = _state(request)
+    if not state.settings.allow_legacy_url_endpoints:
+        return PlainTextResponse(
+            "legacy URL subscriptions are disabled; create a private /s/ link on the home page",
+            status_code=410,
+        )
     raw_url, force_refresh = _extract_url_and_refresh(request, allow_force_refresh)
 
     try:
@@ -475,6 +784,22 @@ async def _convert_endpoint(
     except (ValueError, InvalidSubscriptionURL) as exc:
         return PlainTextResponse(f"invalid request: {exc}", status_code=400)
 
+    return await _convert_validated_url(
+        state,
+        url,
+        fmt,
+        force_refresh=force_refresh,
+    )
+
+
+async def _convert_validated_url(
+    state: AppState,
+    url: str,
+    fmt: str,
+    *,
+    force_refresh: bool,
+) -> Response:
+    """Fetch, render, and return a URL that has already passed SSRF validation."""
     try:
         subscription = await asyncio.wait_for(
             _fetch_subscription(state, url, force_refresh=force_refresh),

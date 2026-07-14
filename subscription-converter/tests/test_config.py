@@ -27,6 +27,12 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
                 "LOG_LEVEL",
                 "ENABLE_DOCS",
                 "ALLOWED_HOSTS",
+                "PERSISTENT_LINKS_",
+                "LINK_",
+                "MAX_ACTIVE_LINKS",
+                "MAX_LINKS_PER_SOURCE",
+                "PUBLIC_BASE_URL",
+                "ALLOW_LEGACY_URL_ENDPOINTS",
             )
         ):
             monkeypatch.delenv(key, raising=False)
@@ -44,6 +50,13 @@ def test_defaults() -> None:
     assert s.dns_ipv6 is False
     assert s.enable_docs is False
     assert s.allowed_hosts == ()
+    assert s.persistent_links_enabled is False
+    assert s.link_database_path == "/var/data/subscriptions.sqlite3"
+    assert s.link_secret_key == ""
+    assert s.max_active_links == 100
+    assert s.max_links_per_source == 3
+    assert s.public_base_url == ""
+    assert s.allow_legacy_url_endpoints is True
 
 
 def test_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -53,6 +66,13 @@ def test_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ENABLE_DOCS", "yes")
     monkeypatch.setenv("ALLOWED_HOSTS", "a.com,b.com")
     monkeypatch.setenv("DNS_NAMESERVER", "https://x.example/dns-query,https://y.example/dns-query")
+    monkeypatch.setenv("PERSISTENT_LINKS_ENABLED", "true")
+    monkeypatch.setenv("LINK_DATABASE_PATH", "/tmp/links.sqlite3")
+    monkeypatch.setenv("LINK_SECRET_KEY", "private-value")
+    monkeypatch.setenv("MAX_ACTIVE_LINKS", "42")
+    monkeypatch.setenv("MAX_LINKS_PER_SOURCE", "2")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://service.example/")
+    monkeypatch.setenv("ALLOW_LEGACY_URL_ENDPOINTS", "false")
     s = Settings()
     assert s.port == 9000
     assert s.cache_ttl_seconds == 120
@@ -60,6 +80,14 @@ def test_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.enable_docs is True
     assert s.allowed_hosts == ("a.com", "b.com")
     assert s.dns_nameserver == ("https://x.example/dns-query", "https://y.example/dns-query")
+    assert s.persistent_links_enabled is True
+    assert s.link_database_path == "/tmp/links.sqlite3"
+    assert s.link_secret_key == "private-value"
+    assert s.max_active_links == 42
+    assert s.max_links_per_source == 2
+    assert s.public_base_url == "https://service.example"
+    assert s.allow_legacy_url_endpoints is False
+    assert "private-value" not in repr(s)
 
 
 def test_invalid_int_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:

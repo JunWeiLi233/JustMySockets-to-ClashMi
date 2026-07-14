@@ -117,6 +117,30 @@ class Settings:
         )
     )
 
+    # Durable, revocable subscription links. The feature is fail-closed: when
+    # enabled, startup requires a valid 32-byte LINK_SECRET_KEY and a writable
+    # database path. The secret is excluded from dataclass repr output.
+    persistent_links_enabled: bool = field(
+        default_factory=lambda: _as_bool("PERSISTENT_LINKS_ENABLED", False)
+    )
+    link_database_path: str = field(
+        default_factory=lambda: os.environ.get(
+            "LINK_DATABASE_PATH", "/var/data/subscriptions.sqlite3"
+        )
+    )
+    link_secret_key: str = field(
+        default_factory=lambda: os.environ.get("LINK_SECRET_KEY", ""),
+        repr=False,
+    )
+    max_active_links: int = field(default_factory=lambda: _as_int("MAX_ACTIVE_LINKS", 100))
+    max_links_per_source: int = field(default_factory=lambda: _as_int("MAX_LINKS_PER_SOURCE", 3))
+    public_base_url: str = field(
+        default_factory=lambda: os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    )
+    allow_legacy_url_endpoints: bool = field(
+        default_factory=lambda: _as_bool("ALLOW_LEGACY_URL_ENDPOINTS", True)
+    )
+
     def with_overrides(self, **kwargs: object) -> Settings:
         """Return a copy with the given fields overridden."""
         return replace(self, **kwargs)  # type: ignore[arg-type]

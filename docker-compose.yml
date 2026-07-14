@@ -18,6 +18,14 @@ services:
       TEST_URL: "https://www.gstatic.com/generate_204"
       TEST_INTERVAL: "300"
       LOG_LEVEL: "INFO"
+      # Durable links are fail-closed and disabled until you provide a stable
+      # 32-byte URL-safe base64 key. See README Part 5.
+      PERSISTENT_LINKS_ENABLED: "${PERSISTENT_LINKS_ENABLED:-false}"
+      LINK_DATABASE_PATH: "/var/data/subscriptions.sqlite3"
+      LINK_SECRET_KEY: "${LINK_SECRET_KEY:-}"
+      MAX_ACTIVE_LINKS: "${MAX_ACTIVE_LINKS:-100}"
+      MAX_LINKS_PER_SOURCE: "${MAX_LINKS_PER_SOURCE:-3}"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-http://localhost:8000}"
       # DNS resolvers (PUBLIC recursive resolvers, never proxy servers).
       DNS_NAMESERVER: "https://dns.alidns.com/dns-query,https://doh.pub/dns-query"
       DNS_FALLBACK: "https://1.1.1.1/dns-query,https://dns.google/dns-query"
@@ -26,9 +34,14 @@ services:
       DNS_IPV6: "false"
       # Optional allow-list of upstream subscription hostnames (comma separated).
       # ALLOWED_HOSTS: "jmssub.net,example.com"
+    volumes:
+      - subscription-data:/var/data
     healthcheck:
       test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','8000')).read()"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  subscription-data:

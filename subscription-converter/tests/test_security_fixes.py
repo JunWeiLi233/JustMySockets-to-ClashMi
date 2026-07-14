@@ -168,6 +168,24 @@ def test_masking_filter_leaves_clean_messages() -> None:
     assert record.getMessage() == "fetched subscription nodes=6"
 
 
+def test_masking_filter_redacts_stable_subscription_tokens() -> None:
+    from subscription_converter.app import _MaskingFilter
+
+    token = "A" * 43
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg=f"GET /s/{token} HTTP/1.1",
+        args=(),
+        exc_info=None,
+    )
+    _MaskingFilter().filter(record)
+    assert token not in record.getMessage()
+    assert "/s/<redacted-token>" in record.getMessage()
+
+
 # === A4: Surge config injection ========================================== #
 
 

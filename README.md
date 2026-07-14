@@ -26,40 +26,37 @@ configuration. The result is exposed through an HTTP endpoint that Clash Mi
 
 ## Part 1 — Quick Start
 
-The fastest path: run it with Docker.
+The fastest durable setup uses Docker plus the named volume already declared in
+`docker-compose.yml`.
 
 ```bash
 # 1. Clone
 git clone https://github.com/JunWeiLi233/JustMySockets-to-ClashMi.git
 cd JustMySockets-to-ClashMi
 
-# 2. Build & run (one command)
+# 2. Generate a key once, then save it in a private .env file
+python3 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'
+
+# .env (replace the placeholder; never commit this file or regenerate the key)
+PERSISTENT_LINKS_ENABLED=true
+LINK_SECRET_KEY=PASTE_THE_GENERATED_KEY
+PUBLIC_BASE_URL=http://localhost:8000
+
+# 3. Build & run
 docker compose up -d --build
 ```
 
 The service now listens on `http://localhost:8000`. Open that address in a
-browser, paste the original subscription link, click **Generate secure link**,
-and copy the result into Clash Mi. The page performs URL encoding locally, so
-there is no Terminal command or online encoder to use.
+browser, paste the original subscription link, and click **Create permanent
+link**. Save both values shown exactly once:
 
-For manual/API use, the generated URL has this shape:
+- The opaque subscription URL goes into Clash Mi.
+- The separate management key permanently closes the link later.
 
-```
-http://<your-host>:8000/clash?url=<URL-encoded subscription URL>
-```
-
-> **What is a "URL-encoded subscription URL"?**
-> Subscription URLs contain characters like `?`, `&`, `=` that break HTTP query
-> strings. The web interface handles this automatically. If you construct the
-> URL manually, encode the entire upstream URL before placing it after `?url=`.
-> For example:
-> ```
-> # raw
-> https://jmssub.net/getsub.php?sid=1&token=abc
-> # URL-encoded (paste this after ?url=)
-> https%3A%2F%2Fjmssub.net%2Fgetsub.php%3Fsid%3D1%26token%3Dabc
-> ```
-That's it — your Clash client will now pull a valid config every time it refreshes.
+The stable URL has the form `https://your-service.example/s/<random-token>` and
+does not expose the original JMS credential. It has no automatic expiry and
+keeps refreshing while this service, its durable storage, and the upstream
+provider remain active.
 
 ---
 
@@ -123,20 +120,29 @@ This adds `pytest` + `pytest-asyncio` (testing), `respx` (HTTP mocking),
 Understanding the pipeline helps you debug and extend the service.
 
 ```
-┌──────────────────┐     ┌──────────────┐     ┌─────────────┐     ┌────────────┐
-│  Clash client    │────▶│  /clash      │────▶│   Parser    │────▶│ Converter  │
-│  (Clash Mi, ...) │◀────│  endpoint    │◀────│  (decode +  │◀────│ (Mihomo    │
-│                  │     │  (FastAPI)   │     │   parse)    │     │  YAML)     │
-└──────────────────┘     └──────────────┘     └─────────────┘     └────────────┘
-                                │                     ▲
-                                │                     │
-                          ┌─────▼─────┐         ┌─────┴─────┐
-                          │   Cache   │         │ Upstream  │
-                          │ (5 min)   │◀────────│ sub URL   │
-                          └───────────┘         └───────────┘
+┌──────────────┐   opaque token   ┌──────────────────┐   decrypted in memory
+│ Clash client │─────────────────▶│ Encrypted link   │─────────────────────┐
+│              │◀─────────────────│ registry (SQLite)│                     │
+└──────────────┘   current config └──────────────────┘                     ▼
+                                                                  ┌──────────────┐
+                                           5-minute memory cache ◀─│ Parser +     │
+                                           ──────────────────────▶│ converter    │
+                                                                  └──────┬───────┘
+                                                                         ▼
+                                                                  Upstream JMS URL
 ```
 
-### 3.1 Parser (input side)
+### 3.1 Durable link registry
+
+- Access and management tokens are independent 256-bit random values.
+- Only HMAC-SHA256 token digests are stored; plaintext bearer tokens are not.
+- Original upstream URLs are encrypted with AES-256-GCM before SQLite writes.
+- Create uses an atomic transaction, so concurrent requests cannot exceed
+  `MAX_ACTIVE_LINKS`.
+- Closing with the management key hard-deletes the record and immediately frees
+  one slot. There is no background expiry job.
+
+### 3.2 Parser (input side)
 
 The parser is **provider-independent** — it doesn't care who published the
 subscription. It:
@@ -155,7 +161,7 @@ subscription. It:
    - `tuic://` — TUIC v5
 4. **Returns** a `Subscription` (the list of nodes + safe upstream metadata).
 
-### 3.2 Converter (output side)
+### 3.3 Converter (output side)
 
 The converter turns the list of `ProxyNode`s into the target format. The
 **Mihomo converter** generates:
@@ -172,7 +178,7 @@ The converter turns the list of `ProxyNode`s into the target format. The
 > Surge and sing-box converters are also wired up (`/surge`, `/sing-box`) and
 > share the same parser — they're intentionally minimal placeholders for now.
 
-### 3.3 Dynamic updates ("always fresh")
+### 3.4 Dynamic updates ("always fresh")
 
 This is the key production behavior:
 
@@ -193,15 +199,22 @@ This is the key production behavior:
 
 | Method | Path        | Description                              | Content-Type       |
 |--------|-------------|------------------------------------------|--------------------|
-| GET    | `/`         | Private browser UI for generating a client URL | `text/html` |
-| GET    | `/health`   | JSON health + cache size                 | `application/json` |
-| GET    | `/clash`    | **Mihomo / Clash Meta YAML** (main use)  | `application/yaml` |
-| GET    | `/surge`    | Surge config (same parser)               | `text/plain`       |
-| GET    | `/sing-box` | sing-box JSON (same parser)              | `application/json` |
-| POST   | `/api/check`| Private same-origin connection check     | `application/json` |
-| GET    | `/docs`     | Swagger UI when `ENABLE_DOCS=true`       | `text/html`        |
+| GET    | `/`                  | Create/manage browser interface                     | `text/html` |
+| GET    | `/health`            | Health, cache, and durable-store readiness           | `application/json` |
+| GET    | `/api/capacity`      | Active limit and remaining creation slots            | `application/json` |
+| POST   | `/api/check`         | Test without storing                                 | `application/json` |
+| POST   | `/api/links`         | Verify and create an encrypted permanent link        | `application/json` |
+| POST   | `/api/links/close`   | Permanently close using a management key in the body | `application/json` |
+| GET    | `/s/{access_token}`  | Current config for one durable link                  | format-specific |
+| GET    | `/clash`, `/surge`, `/sing-box` | Legacy raw-URL endpoints (optional)         | format-specific |
+| GET    | `/docs`              | Swagger UI when `ENABLE_DOCS=true`                   | `text/html` |
 
-All conversion endpoints (`/clash`, `/surge`, `/sing-box`) take:
+The UI is the supported creation flow. It verifies the upstream before storing,
+returns the management key only in the `no-store` creation response, and never
+puts that key in a URL. Legacy conversion endpoints can be disabled with
+`ALLOW_LEGACY_URL_ENDPOINTS=false` after users migrate.
+
+Legacy endpoints (`/clash`, `/surge`, `/sing-box`) take:
 
 - **`?url=<subscription URL>`** (required, URL-encoded)
 - **`&force_refresh=true`** (optional) — bypass the cache and re-download now.
@@ -246,6 +259,13 @@ All settings are **environment variables**. You can set them before running
 | `LOG_LEVEL`               | `INFO`                               | Logging verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`).                  |
 | `ENABLE_DOCS`             | `false`                              | Expose Swagger/OpenAPI docs. Disabled by default to reduce public attack surface. |
 | `ALLOWED_HOSTS`           | *(empty = all allowed)*              | Comma-separated allow-list of upstream hostnames (SSRF defence).        |
+| `PERSISTENT_LINKS_ENABLED`| `false`                              | Enable encrypted permanent links; startup fails closed if required settings are unsafe. |
+| `LINK_DATABASE_PATH`      | `/var/data/subscriptions.sqlite3`    | SQLite file; this directory **must** be a durable volume in production. |
+| `LINK_SECRET_KEY`         | *(required when enabled)*            | URL-safe base64 encoding of exactly 32 random bytes. Never rotate or lose it while records exist. |
+| `PUBLIC_BASE_URL`         | *(required when enabled)*            | Canonical HTTPS origin used in generated links. Local HTTP is accepted only for localhost. |
+| `MAX_ACTIVE_LINKS`        | `100`                                | Atomic global creation cap. Existing links continue working when full. |
+| `MAX_LINKS_PER_SOURCE`    | `3`                                  | Maximum links for the same upstream URL and output format.             |
+| `ALLOW_LEGACY_URL_ENDPOINTS` | `true`                           | Keep or disable raw `?url=` endpoints after migration.                 |
 
 **Example — set a config via environment variables (no Docker):**
 
@@ -265,21 +285,26 @@ credentials). Key safeguards:
 - **Subscription URLs and passwords are NEVER logged.** A process-wide logging
   filter redacts any `url=...` value before it reaches any log handler.
 - **The browser UI has no analytics, third-party assets, cookies, or browser
-  storage.** Link generation happens locally; the URL is sent only after the
-  user explicitly checks it or a client requests the generated endpoint.
+  storage.** Sensitive values are sent only after an explicit test, create, or
+  close action.
+- **Durable source URLs use AES-256-GCM authenticated encryption.** The database
+  stores only ciphertext plus HMAC digests of access/management tokens. The
+  management key is returned once and never placed in request URLs.
 - **Rendered configurations are `private, no-store`.** Shared caches, CDNs, and
   browser caches are instructed not to retain proxy credentials.
-- **Cache lookup keys are HMAC digests**, never raw URLs. Parsed nodes are held
-  only in process memory until the configured TTL expires; nothing is persisted.
+- **Cache lookup keys are HMAC digests**, never raw URLs. Parsed proxy nodes are
+  held only in process memory until TTL expiry; only the encrypted upstream URL
+  is durable.
 - **Strict browser headers** enforce a nonce-based CSP, no referrers, no framing,
   no MIME sniffing, and no access to camera/location/microphone APIs.
 - **The Docker container runs as a non-root user** (uid 1001).
 - **`ALLOWED_HOSTS`** restricts which upstream providers may be contacted
   (defence-in-depth against SSRF via the `?url=` parameter).
 
-> ⚠️ **If you expose this service publicly**, anyone who knows your subscription
-> URL can use your instance. Put it behind an authenticating reverse proxy,
-> Cloudflare Access, or a shared-secret path.
+> A generated subscription URL is still a bearer credential: anyone who obtains
+> it can download that config. Keep both it and the more-powerful management key
+> private. No system can guarantee literal forever availability; service billing,
+> storage/key retention, domain continuity, and the upstream provider all matter.
 
 ---
 
@@ -301,11 +326,24 @@ converter.yourdomain.com {
 }
 ```
 
-### 7.2 Railway / Render / Fly.io
+### 7.2 Render durable deployment
 
-Deploy from this repo; the platform auto-detects the `Dockerfile`. The CMD
-honors the `$PORT` environment variable that these platforms inject. Subscribe
-with `https://<your-app>.<platform>/clash?url=...`.
+Render filesystems are ephemeral unless a persistent disk is attached. For the
+permanent-link feature:
+
+1. Use a paid web service and attach the smallest persistent disk at `/var/data`.
+2. Set `PERSISTENT_LINKS_ENABLED=true`, `LINK_DATABASE_PATH=/var/data/subscriptions.sqlite3`,
+   a generated `LINK_SECRET_KEY`, the canonical `PUBLIC_BASE_URL`, and a conservative
+   `MAX_ACTIVE_LINKS`.
+3. Keep one service instance (`WORKERS=1` is recommended on the Starter plan).
+4. Back up the encryption key separately. Render disk snapshots cannot decrypt
+   records without it.
+
+Render currently lists Starter compute at $7/month and persistent SSD storage at
+$0.25/GB/month, so a 1 GB disk is approximately $7.25/month before bandwidth.
+See the official [persistent disk documentation](https://render.com/docs/disks)
+and [pricing](https://render.com/pricing). A disk prevents horizontal scaling;
+migrate the store to managed Postgres before moving to multiple instances.
 
 ### 7.3 Cloudflare Tunnel
 
@@ -381,38 +419,33 @@ OpenClash 等)直接订阅。
 
 ## 第 1 部分 —— 快速开始
 
-最快的方式:用 Docker 运行。
+最快的持久化方式:使用 Docker 和 `docker-compose.yml` 中已经声明的命名卷。
 
 ```bash
 # 1. 克隆
 git clone https://github.com/JunWeiLi233/JustMySockets-to-ClashMi.git
 cd JustMySockets-to-ClashMi
 
-# 2. 一条命令构建并运行
+# 2. 只生成一次密钥,并保存到私有 .env 文件
+python3 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'
+
+# .env(替换占位符;不要提交该文件,有记录后不要重新生成密钥)
+PERSISTENT_LINKS_ENABLED=true
+LINK_SECRET_KEY=粘贴刚才生成的密钥
+PUBLIC_BASE_URL=http://localhost:8000
+
+# 3. 构建并运行
 docker compose up -d --build
 ```
 
 服务现在监听 `http://localhost:8000`。用浏览器打开此地址,粘贴原始订阅地址,
-点击 **Generate secure link**,然后把生成结果复制到 Clash Mi。网页会在本地完成
-URL 编码,不需要终端命令或在线编码网站。
+点击 **Create permanent link**。页面只显示一次两个值:
 
-手动/API 使用时,生成地址的格式为:
+- 把不透明的订阅 URL 加入 Clash Mi。
+- 单独保存管理密钥,以后用它永久关闭该链接。
 
-```
-http://<你的主机>:8000/clash?url=<URL 编码后的订阅地址>
-```
-
-> **什么是"URL 编码后的订阅地址"?**
-> 订阅地址里含有 `?`、`&`、`=` 等字符,会破坏 HTTP 查询字符串。你必须先把整
-> 个订阅地址做 URL 编码,再粘贴到 `?url=` 后面。网页界面会自动完成此操作。
-> 手动构造时例如:
-> ```
-> # 原始
-> https://jmssub.net/getsub.php?sid=1&token=abc
-> # URL 编码后(粘贴到 ?url= 后面)
-> https%3A%2F%2Fjmssub.net%2Fgetsub.php%3Fsid%3D1%26token%3Dabc
-> ```
-完成 —— 你的 Clash 客户端每次刷新都会拉取一份有效配置。
+稳定地址形如 `https://你的服务/s/<随机令牌>`,不会暴露原始 JMS 凭据。它不
+自动过期;只要本服务、持久磁盘和上游供应商都保持可用,客户端就会持续刷新。
 
 ---
 
@@ -475,20 +508,27 @@ pip install -r requirements-dev.txt
 理解这条流水线有助于排查问题和扩展功能。
 
 ```
-┌──────────────────┐     ┌──────────────┐     ┌─────────────┐     ┌────────────┐
-│  Clash 客户端     │────▶│  /clash      │────▶│   解析器     │────▶│  转换器     │
-│  (Clash Mi ...)  │◀────│  接口         │◀────│ (解码+解析)  │◀────│ (Mihomo    │
-│                  │     │  (FastAPI)   │     │             │     │  YAML)     │
-└──────────────────┘     └──────────────┘     └─────────────┘     └────────────┘
-                                │                     ▲
-                                │                     │
-                          ┌─────▼─────┐         ┌─────┴─────┐
-                          │   缓存     │         │ 上游订阅   │
-                          │ (5 分钟)   │◀────────│  地址      │
-                          └───────────┘         └───────────┘
+┌──────────────┐   不透明令牌   ┌──────────────────┐   仅在内存解密
+│ Clash 客户端 │───────────────▶│ 加密链接注册表     │─────────────────────┐
+│              │◀───────────────│ (SQLite)         │                     │
+└──────────────┘   当前配置      └──────────────────┘                     ▼
+                                                                ┌──────────────┐
+                                         5 分钟内存缓存 ◀────────│ 解析器 +      │
+                                         ──────────────────────▶│ 转换器        │
+                                                                └──────┬───────┘
+                                                                       ▼
+                                                                上游 JMS 地址
 ```
 
-### 3.1 解析器(输入侧)
+### 3.1 持久链接注册表
+
+- 访问令牌和管理密钥是两个独立的 256 位随机值。
+- 磁盘只保存令牌的 HMAC-SHA256 摘要,不保存明文令牌。
+- 原始上游 URL 在写入 SQLite 前使用 AES-256-GCM 认证加密。
+- 创建使用原子事务,并发请求无法突破 `MAX_ACTIVE_LINKS`。
+- 使用管理密钥关闭后会硬删除记录并立即释放名额;没有后台自动过期。
+
+### 3.2 解析器(输入侧)
 
 解析器**与供应商无关** —— 它不关心是谁发布的订阅。它会:
 
@@ -506,7 +546,7 @@ pip install -r requirements-dev.txt
    - `tuic://` —— TUIC v5
 4. **返回**一个 `Subscription`(节点列表 + 安全的上游元数据)。
 
-### 3.2 转换器(输出侧)
+### 3.3 转换器(输出侧)
 
 转换器把 `ProxyNode` 列表转换成目标格式。**Mihomo 转换器**会生成:
 
@@ -521,7 +561,7 @@ pip install -r requirements-dev.txt
 > Surge 和 sing-box 转换器也已接好(`/surge`、`/sing-box`),共用同一个解析
 > 器 —— 目前是刻意精简的占位实现。
 
-### 3.3 动态更新("始终最新")
+### 3.4 动态更新("始终最新")
 
 这是关键的生产级行为:
 
@@ -539,15 +579,21 @@ pip install -r requirements-dev.txt
 
 | 方法 | 路径        | 说明                                    | Content-Type       |
 |------|-------------|-----------------------------------------|--------------------|
-| GET  | `/`         | 用于生成客户端订阅地址的隐私网页界面      | `text/html` |
-| GET  | `/health`   | JSON 健康状态 + 缓存大小                | `application/json` |
-| GET  | `/clash`    | **Mihomo / Clash Meta YAML**(主要用途) | `application/yaml` |
-| GET  | `/surge`    | Surge 配置(同一解析器)                | `text/plain`       |
-| GET  | `/sing-box` | sing-box JSON(同一解析器)             | `application/json` |
-| POST | `/api/check`| 同源私密连接检查                        | `application/json` |
-| GET  | `/docs`     | `ENABLE_DOCS=true` 时的 Swagger UI     | `text/html`        |
+| GET  | `/`                  | 创建/管理网页界面                         | `text/html` |
+| GET  | `/health`            | 健康、缓存和持久存储状态                    | `application/json` |
+| GET  | `/api/capacity`      | 活跃上限和剩余创建名额                      | `application/json` |
+| POST | `/api/check`         | 测试但不保存                              | `application/json` |
+| POST | `/api/links`         | 验证并创建加密的永久链接                    | `application/json` |
+| POST | `/api/links/close`   | 用请求体中的管理密钥永久关闭                | `application/json` |
+| GET  | `/s/{access_token}`  | 一个持久链接的当前配置                      | 取决于格式 |
+| GET  | `/clash`、`/surge`、`/sing-box` | 可选的旧式原始 URL 接口          | 取决于格式 |
+| GET  | `/docs`              | `ENABLE_DOCS=true` 时的 Swagger UI         | `text/html` |
 
-所有转换接口(`/clash`、`/surge`、`/sing-box`)都接受:
+网页界面是推荐创建流程。它先验证上游,管理密钥只出现在 `no-store` 创建响应中,
+绝不会放进 URL。所有用户迁移后,可用 `ALLOW_LEGACY_URL_ENDPOINTS=false` 关闭
+旧接口。
+
+旧转换接口(`/clash`、`/surge`、`/sing-box`)接受:
 
 - **`?url=<订阅地址>`**(必填,需 URL 编码)
 - **`&force_refresh=true`**(可选)—— 绕过缓存,立即重新下载。
@@ -592,6 +638,13 @@ curl http://localhost:8000/health
 | `LOG_LEVEL`               | `INFO`                               | 日志级别(`DEBUG`/`INFO`/`WARNING`/`ERROR`)。            |
 | `ENABLE_DOCS`             | `false`                              | 是否公开 Swagger/OpenAPI 文档。默认关闭以缩小攻击面。    |
 | `ALLOWED_HOSTS`           | *(空 = 全部允许)*                    | 允许的上游主机名白名单(逗号分隔,防 SSRF)。             |
+| `PERSISTENT_LINKS_ENABLED`| `false`                              | 启用加密永久链接;设置不安全时启动会失败。               |
+| `LINK_DATABASE_PATH`      | `/var/data/subscriptions.sqlite3`    | SQLite 文件;生产环境目录必须挂载持久卷。                |
+| `LINK_SECRET_KEY`         | *(启用时必填)*                       | 32 个随机字节的 URL-safe Base64;有记录时不可丢失或轮换。 |
+| `PUBLIC_BASE_URL`         | *(启用时必填)*                       | 生成链接使用的 HTTPS 规范域名;只有 localhost 可用 HTTP。 |
+| `MAX_ACTIVE_LINKS`        | `100`                                | 原子全局创建上限;满额后已有链接继续工作。                |
+| `MAX_LINKS_PER_SOURCE`    | `3`                                  | 同一上游 URL + 输出格式最多创建多少个链接。              |
+| `ALLOW_LEGACY_URL_ENDPOINTS` | `true`                           | 迁移后是否关闭旧式 `?url=` 接口。                       |
 
 **示例 —— 用环境变量配置(无 Docker):**
 
@@ -609,19 +662,22 @@ uvicorn subscription_converter.app:app --host 0.0.0.0 --port 9000
 
 - **订阅地址和密码绝不写入日志。** 进程级的日志过滤器会在任何日志处理器收到
   记录前,抹除所有 `url=...` 的值。
-- **网页界面不包含分析、第三方资源、Cookie 或浏览器存储。** 订阅地址仅在浏览
-  器本地生成;只有用户主动检查或客户端请求生成接口时才发送。
+- **网页界面不包含分析、第三方资源、Cookie 或浏览器存储。** 敏感值只在用户明
+  确点击测试、创建或关闭时发送。
+- **持久源 URL 使用 AES-256-GCM 认证加密。** 数据库只保存密文及访问/管理令牌
+  的 HMAC 摘要。管理密钥仅返回一次,永远不放进请求 URL。
 - **生成配置使用 `private, no-store`。** 共享缓存、CDN 和浏览器缓存不得保留
   代理凭据。
-- **缓存查找键只存 URL 的 HMAC 摘要**,不存原始 URL。解析后的节点只在进程
-  内存中保留到 TTL 到期,不会持久化。
+- **缓存查找键只存 URL 的 HMAC 摘要**,不存原始 URL。代理节点只在内存保留
+  到 TTL 到期;持久化的只有加密后的上游 URL。
 - **严格浏览器安全响应头**包含 nonce CSP、禁止 referrer、禁止 iframe、禁止
   MIME 猜测及禁用相机/定位/麦克风等权限。
 - **Docker 容器以非 root 用户运行**(uid 1001)。
 - **`ALLOWED_HOSTS`** 限制可访问哪些上游供应商(防 SSRF 的纵深防御)。
 
-> ⚠️ **如果你把本服务公开到互联网**,任何知道你订阅地址的人都能使用你的实
-> 例。请放在带鉴权的反向代理、Cloudflare Access 或共享密钥路径后面。
+> 生成的订阅 URL 仍是 bearer 凭据:拿到它的人可以下载配置。订阅 URL 和权限
+> 更高的管理密钥都必须保密。任何系统都不能承诺字面意义上的永久可用;服务付
+> 费、磁盘与密钥保留、域名和上游供应商都必须持续有效。
 
 ---
 
@@ -643,10 +699,20 @@ converter.yourdomain.com {
 }
 ```
 
-### 7.2 Railway / Render / Fly.io
+### 7.2 Render 持久化部署
 
-从此仓库部署,平台会自动识别 `Dockerfile`。CMD 会读取这些平台注入的 `$PORT`
-环境变量。用 `https://<你的应用>.<平台>/clash?url=...` 订阅。
+Render 默认文件系统是临时的。永久链接功能需要:
+
+1. 使用付费 Web Service,并把最小的持久磁盘挂载到 `/var/data`。
+2. 设置 `PERSISTENT_LINKS_ENABLED=true`、`LINK_DATABASE_PATH=/var/data/subscriptions.sqlite3`、
+   一次性生成的 `LINK_SECRET_KEY`、规范 `PUBLIC_BASE_URL` 和保守的 `MAX_ACTIVE_LINKS`。
+3. 保持一个服务实例(Starter 套餐建议 `WORKERS=1`)。
+4. 单独备份加密密钥;只有磁盘快照、没有密钥也无法解密记录。
+
+Render 目前 Starter 计算为每月 7 美元,持久 SSD 为每 GB 每月 0.25 美元,因此
+1 GB 磁盘约为每月 7.25 美元(不含额外带宽)。请查看官方
+[持久磁盘文档](https://render.com/docs/disks)和[价格](https://render.com/pricing)。
+挂载磁盘后不能横向扩容;需要多实例前应把存储迁移到托管 Postgres。
 
 ### 7.3 Cloudflare Tunnel
 

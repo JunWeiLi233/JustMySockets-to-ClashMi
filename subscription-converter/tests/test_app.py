@@ -8,14 +8,17 @@ the full fetch->parse->render->cache flow.
 from __future__ import annotations
 
 import base64
+from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
 import respx
 import yaml
 from fastapi.testclient import TestClient
-from subscription_converter.app import create_app
+from subscription_converter.app import AppState, create_app
 from subscription_converter.config import Settings
+from subscription_converter.link_store import LinkStoreConfigurationError
 from subscription_converter.network_guard import default_url_validator
 from subscription_converter.subscription_parser import SubscriptionParser
 
@@ -36,6 +39,7 @@ VMESS_LINK = (
     ).decode()
 )
 MIXED = "\n".join([SS_LINK, VMESS_LINK])
+LINK_SECRET_KEY = base64.urlsafe_b64encode(bytes(range(32))).decode()
 
 
 @pytest.fixture()
@@ -52,6 +56,27 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         yield c
 
 
+@pytest.fixture()
+def persistent_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
+    """App with encrypted durable links enabled on a temporary SQLite file."""
+
+    async def stub(self: SubscriptionParser, url: str) -> object:
+        return self.parse_text(MIXED)
+
+    monkeypatch.setattr(SubscriptionParser, "fetch_and_parse", stub)
+    settings = Settings().with_overrides(
+        persistent_links_enabled=True,
+        link_database_path=str(tmp_path / "links.sqlite3"),
+        link_secret_key=LINK_SECRET_KEY,
+        max_active_links=2,
+        max_links_per_source=2,
+        public_base_url="https://testserver",
+    )
+    app = create_app(settings, url_validator=default_url_validator(resolve=False))
+    with TestClient(app) as c:
+        yield c
+
+
 # --- basic endpoints ------------------------------------------------------ #
 
 
@@ -60,7 +85,9 @@ def test_root(client: TestClient) -> None:
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/html")
     assert "JMS Config Bridge" in r.text
-    assert "Generate secure link" in r.text
+    assert "Create permanent link" in r.text
+    assert "Permanently close link" in r.text
+    assert "/api/links" in r.text
     assert "https://sub.example.com" not in r.text
 
 
@@ -85,6 +112,166 @@ def test_health(client: TestClient) -> None:
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+    assert r.json()["persistent_links"] == "disabled"
+
+
+def test_capacity_reports_disabled_by_default(client: TestClient) -> None:
+    r = client.get("/api/capacity")
+    assert r.status_code == 200
+    assert r.json() == {
+        "status": "ok",
+        "enabled": False,
+        "accepting": False,
+        "active": 0,
+        "limit": 0,
+        "remaining": 0,
+    }
+    assert r.headers["cache-control"] == "private, no-store, max-age=0"
+
+
+# --- durable opaque links ------------------------------------------------- #
+
+
+def test_persistent_link_create_fetch_and_close_end_to_end(
+    persistent_client: TestClient,
+) -> None:
+    created = persistent_client.post(
+        "/api/links",
+        json={"url": SUB_URL, "format": "clash"},
+    )
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["status"] == "ok"
+    assert payload["expires_at"] is None
+    assert payload["nodes"] == 2
+    assert payload["subscription_url"].startswith("https://testserver/s/")
+    assert len(payload["manage_key"]) == 43
+    assert SUB_URL not in created.text
+    assert created.headers["cache-control"] == "private, no-store, max-age=0"
+
+    path = urlsplit(payload["subscription_url"]).path
+    rendered = persistent_client.get(path)
+    assert rendered.status_code == 200
+    assert rendered.headers["content-type"].startswith("application/yaml")
+    assert rendered.headers["cache-control"] == "private, no-store, max-age=0"
+    assert len(yaml.safe_load(rendered.text)["proxies"]) == 2
+
+    health = persistent_client.get("/health").json()
+    assert health["persistent_links"] == "ready"
+    assert health["active_links"] == 1
+
+    closed = persistent_client.post(
+        "/api/links/close",
+        json={"manage_key": payload["manage_key"]},
+    )
+    assert closed.status_code == 200
+    assert closed.json()["status"] == "closed"
+    assert persistent_client.get(path).status_code == 404
+    assert persistent_client.get("/api/capacity").json()["remaining"] == 2
+
+
+def test_access_and_management_tokens_have_separate_authority(
+    persistent_client: TestClient,
+) -> None:
+    payload = persistent_client.post(
+        "/api/links",
+        json={"url": SUB_URL, "format": "clash"},
+    ).json()
+    access_token = urlsplit(payload["subscription_url"]).path.rsplit("/", 1)[-1]
+
+    assert persistent_client.get(f"/s/{payload['manage_key']}").status_code == 404
+    cannot_close = persistent_client.post(
+        "/api/links/close",
+        json={"manage_key": access_token},
+    )
+    assert cannot_close.status_code == 404
+    assert persistent_client.get(f"/s/{access_token}").status_code == 200
+
+
+def test_capacity_closes_creation_but_existing_links_continue(
+    persistent_client: TestClient,
+) -> None:
+    urls: list[str] = []
+    for index in range(2):
+        response = persistent_client.post(
+            "/api/links",
+            json={"url": f"{SUB_URL}&slot={index}", "format": "clash"},
+        )
+        assert response.status_code == 201
+        urls.append(urlsplit(response.json()["subscription_url"]).path)
+
+    capacity = persistent_client.get("/api/capacity").json()
+    assert capacity["accepting"] is False
+    assert capacity["remaining"] == 0
+    rejected = persistent_client.post(
+        "/api/links",
+        json={"url": f"{SUB_URL}&slot=third", "format": "clash"},
+    )
+    assert rejected.status_code == 503
+    assert rejected.json()["code"] == "capacity_reached"
+    assert rejected.headers["retry-after"] == "3600"
+    assert all(persistent_client.get(path).status_code == 200 for path in urls)
+
+
+def test_persistent_link_mutations_reject_cross_site_browser_requests(
+    persistent_client: TestClient,
+) -> None:
+    create = persistent_client.post(
+        "/api/links",
+        headers={"Sec-Fetch-Site": "cross-site"},
+        json={"url": SUB_URL, "format": "clash"},
+    )
+    close = persistent_client.post(
+        "/api/links/close",
+        headers={"Sec-Fetch-Site": "cross-site"},
+        json={"manage_key": "x" * 43},
+    )
+    assert create.status_code == 403
+    assert close.status_code == 403
+    assert create.json()["code"] == "cross_site"
+    assert close.json()["code"] == "cross_site"
+
+
+def test_persistent_link_requires_https(persistent_client: TestClient) -> None:
+    response = persistent_client.post(
+        "/api/links",
+        json={"url": "http://sub.example.com/getsub", "format": "clash"},
+    )
+    assert response.status_code == 400
+    assert response.json()["code"] == "https_required"
+
+
+def test_legacy_url_endpoints_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stub(self: SubscriptionParser, url: str) -> object:
+        return self.parse_text(MIXED)
+
+    monkeypatch.setattr(SubscriptionParser, "fetch_and_parse", stub)
+    settings = Settings().with_overrides(allow_legacy_url_endpoints=False)
+    app = create_app(settings, url_validator=default_url_validator(resolve=False))
+    with TestClient(app) as local_client:
+        response = local_client.get("/clash", params={"url": SUB_URL})
+    assert response.status_code == 410
+    assert "create a private /s/ link" in response.text
+
+
+@pytest.mark.parametrize(
+    "public_base_url",
+    ["", "http://public.example.com", "https://user:pass@example.com", "https://example.com/path"],
+)
+def test_persistent_links_fail_closed_for_unsafe_public_base_url(
+    tmp_path: Path,
+    public_base_url: str,
+) -> None:
+    settings = Settings().with_overrides(
+        persistent_links_enabled=True,
+        link_database_path=str(tmp_path / "links.sqlite3"),
+        link_secret_key=LINK_SECRET_KEY,
+        public_base_url=public_base_url,
+    )
+    with pytest.raises(LinkStoreConfigurationError, match="PUBLIC_BASE_URL"):
+        AppState(settings, url_validator=default_url_validator(resolve=False))
 
 
 # --- /clash --------------------------------------------------------------- #
