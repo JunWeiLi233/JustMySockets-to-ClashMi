@@ -92,7 +92,10 @@ class SubscriptionParser:
                 follow_redirects=True,
                 max_redirects=self._max_redirects,
                 event_hooks={"request": [self._request_hook]},
-                headers={"User-Agent": self._user_agent},
+                # Some subscription providers return a mismatched compressed
+                # response through their CDN. Identity encoding also ensures
+                # our byte cap applies to exactly what the provider sends.
+                headers={"User-Agent": self._user_agent, "Accept-Encoding": "identity"},
             ) as client:
                 # Stream so we can enforce a hard cap on response size (A2).
                 async with client.stream("GET", url) as resp:
@@ -112,6 +115,8 @@ class SubscriptionParser:
             ) from exc
         except httpx.TooManyRedirects as exc:
             raise SubscriptionFetchError("upstream redirected too many times") from exc
+        except httpx.DecodingError as exc:
+            raise SubscriptionFetchError("upstream sent an invalid encoded response") from exc
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             raise SubscriptionFetchError(
                 f"failed to fetch subscription: {exc.__class__.__name__}"

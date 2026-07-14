@@ -97,6 +97,27 @@ async def test_fetch_raises_on_network_error(parser: SubscriptionParser) -> None
         await parser.fetch_and_parse(SUB_URL)
 
 
+@respx.mock
+async def test_fetch_requests_identity_encoding(parser: SubscriptionParser) -> None:
+    route = respx.get(SUB_URL).mock(return_value=httpx.Response(200, text=SS_LINK))
+    await parser.fetch_and_parse(SUB_URL)
+    assert route.calls[0].request.headers["accept-encoding"] == "identity"
+
+
+@respx.mock
+async def test_fetch_reports_invalid_encoded_response(
+    parser: SubscriptionParser,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_decode(_response: httpx.Response) -> bytes:
+        raise httpx.DecodingError("incorrect header check")
+
+    monkeypatch.setattr(parser, "_read_capped", fail_decode)
+    respx.get(SUB_URL).mock(return_value=httpx.Response(200, text=SS_LINK))
+    with pytest.raises(SubscriptionFetchError, match="invalid encoded response"):
+        await parser.fetch_and_parse(SUB_URL)
+
+
 # --- parse_text edge cases ------------------------------------------------ #
 
 
