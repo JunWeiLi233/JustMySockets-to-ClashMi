@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 
-from subscription_converter.converters import BaseConverter
+from subscription_converter.converters import BaseConverter, ConversionError
 from subscription_converter.models import ProxyNode, ProxyType
 
 __all__ = ["SingBoxConverter"]
@@ -25,6 +25,7 @@ class SingBoxConverter(BaseConverter):
     def render(self, nodes: Iterable[ProxyNode]) -> str:
         outbounds: list[dict[str, object]] = [{"type": "direct", "tag": "direct"}]
         tags: list[str] = ["direct"]
+        emitted = 0
         for node in nodes:
             if node.type != ProxyType.SS:
                 continue
@@ -39,6 +40,9 @@ class SingBoxConverter(BaseConverter):
                 }
             )
             tags.append(node.safe_name)
+            emitted += 1
+        if emitted == 0:
+            raise ConversionError("no renderable proxies after conversion")
         selector = {"type": "selector", "tag": "SELECT", "outbounds": tags}
         config: dict[str, object] = {
             "log": {"level": "info"},

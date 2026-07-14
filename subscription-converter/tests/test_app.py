@@ -16,6 +16,7 @@ import yaml
 from fastapi.testclient import TestClient
 from subscription_converter.app import create_app
 from subscription_converter.config import Settings
+from subscription_converter.network_guard import default_url_validator
 from subscription_converter.subscription_parser import SubscriptionParser
 
 __all__ = ()
@@ -46,7 +47,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
         return await real(self, url) if url.endswith("/dynamic") else self.parse_text(MIXED)
 
     monkeypatch.setattr(SubscriptionParser, "fetch_and_parse", stub)
-    app = create_app(Settings())
+    app = create_app(Settings(), url_validator=default_url_validator(resolve=False))
     with TestClient(app) as c:
         yield c
 
@@ -138,7 +139,10 @@ def test_parse_error_returns_400(client: TestClient, monkeypatch: pytest.MonkeyP
 
 def test_disallowed_host_returns_400(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings().with_overrides(allowed_hosts=("only-this.example.com",))
-    app = create_app(settings)
+    app = create_app(
+        settings,
+        url_validator=default_url_validator(settings.allowed_hosts, resolve=False),
+    )
     with TestClient(app) as c:
         r = c.get("/clash", params={"url": "https://other.example.com/x"})
         assert r.status_code == 400
@@ -171,7 +175,7 @@ def test_singbox_endpoint(client: TestClient) -> None:
 def test_dynamic_upstream_change_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
     """A real upstream change is reflected after force_refresh."""
     respx.get(SUB_URL).mock(return_value=httpx.Response(200, text=MIXED))
-    app = create_app(Settings())
+    app = create_app(Settings(), url_validator=default_url_validator(resolve=False))
     with TestClient(app) as c:
         r1 = c.get("/clash", params={"url": SUB_URL})
         d1 = yaml.safe_load(r1.text)

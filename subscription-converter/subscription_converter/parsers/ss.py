@@ -22,6 +22,14 @@ def _normalise_plugin_name(raw: str | None) -> str | None:
     return r or None
 
 
+def _safe_port(raw: str) -> int:
+    """Parse a port, raising ``ParserError`` (not ValueError) on bad input."""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ParserError(f"ss port not an integer: {raw!r}") from exc
+
+
 class ShadowsocksParser:
     """Parses ``ss://`` URIs (SIP002 and legacy base64-wrapped forms)."""
 
@@ -81,7 +89,7 @@ class ShadowsocksParser:
             type=ProxyType.SS,
             name=name or f"ss-{server}-{port_s}",
             server=server,
-            port=int(port_s),
+            port=_safe_port(port_s),
             cipher=cipher,
             password=unquote(password),
             plugin=_normalise_plugin_name(plugin_raw),
@@ -106,7 +114,7 @@ class ShadowsocksParser:
             type=ProxyType.SS,
             name=name or f"ss-{server}-{port_s}",
             server=server,
-            port=int(port_s),
+            port=_safe_port(port_s),
             cipher=cipher,
             password=unquote(password),
         )

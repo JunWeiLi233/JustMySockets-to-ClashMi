@@ -29,7 +29,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Final
-from urllib.parse import urlparse
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import PlainTextResponse, Response
@@ -40,6 +39,7 @@ from subscription_converter.converter_registry import get_converter
 from subscription_converter.converters import BaseConverter, ConversionError
 from subscription_converter.converters.mihomo import MihomoConverter
 from subscription_converter.models import Subscription
+from subscription_converter.network_guard import SSRFError, UrlValidator, default_url_validator
 from subscription_converter.parser_port import ParserRegistry
 from subscription_converter.parsers import default_registry
 from subscription_converter.subscription_parser import (
@@ -70,36 +70,34 @@ _USERINFO_HEADER: Final[str] = "subscription-userinfo"
 
 
 class _MaskingFilter(logging.Filter):
-    """Strip the value of any ``url=`` parameter from log messages."""
+    """Redact subscription URLs and credentials from every log record.
+
+    Catches three leak shapes:
+    1. ``url=<value>`` tokens (our own structured logs).
+    2. Bare ``https?://...`` URLs anywhere (httpx DEBUG request logs, exception
+       messages that embed the upstream URL).
+    3. ``<secret-key>=<value>`` tokens for credential-ish keys
+       (token / password / secret / key / auth / uuid / sid / id).
+    """
+
+    _URL_RE = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
+    _SECRET_RE = re.compile(r"(?i)(token|password|passwd|secret|key|auth|uuid|sid|id)=\S+")
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
         except Exception:  # pragma: no cover - defensive
             return True
-        if "url=" in msg:
-            record.msg = _redact_url(msg)
+        redacted = self._redact(msg)
+        if redacted != msg:
+            record.msg = redacted
             record.args = ()
         return True
 
-
-def _redact_url(text: str) -> str:
-    out: list[str] = []
-    i = 0
-    needle = "url="
-    while True:
-        idx = text.find(needle, i)
-        if idx < 0:
-            out.append(text[i:])
-            break
-        out.append(text[i : idx + len(needle)])
-        start_val = idx + len(needle)
-        end_val = start_val
-        while end_val < len(text) and not text[end_val].isspace():
-            end_val += 1
-        out.append("<redacted>")
-        i = end_val
-    return "".join(out)
+    def _redact(self, text: str) -> str:
+        text = self._URL_RE.sub("<redacted-url>", text)
+        text = self._SECRET_RE.sub(lambda m: m.group(1) + "=<redacted>", text)
+        return text
 
 
 def configure_logging(level: str) -> None:
@@ -110,7 +108,20 @@ def configure_logging(level: str) -> None:
     filt = _MaskingFilter()
     root = logging.getLogger()
     root.addFilter(filt)
-    for name in ("uvicorn", "uvicorn.access", "fastapi", "subscription_converter"):
+    # Cover the libraries that emit request/URL details. These propagate to the
+    # root logger by default; attaching explicitly is belt-and-braces against a
+    # library setting ``propagate = False``.
+    for name in (
+        "uvicorn",
+        "uvicorn.access",
+        "uvicorn.error",
+        "fastapi",
+        "httpx",
+        "httpcore",
+        "anyio",
+        "h11",
+        "subscription_converter",
+    ):
         logging.getLogger(name).addFilter(filt)
 
 
@@ -128,13 +139,21 @@ class AppState:
     settings.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        url_validator: UrlValidator | None = None,
+    ) -> None:
         self.settings = settings
         self.registry: ParserRegistry = default_registry()
+        # Production resolves DNS to block SSRF; tests inject a no-resolve validator.
+        self.url_validator = url_validator or default_url_validator(settings.allowed_hosts)
         self.parser = SubscriptionParser(
             registry=self.registry,
             user_agent=settings.fetch_user_agent,
             timeout=settings.fetch_timeout_seconds,
+            url_validator=self.url_validator,
         )
         self.cache: TTLCache[Subscription] = TTLCache(
             ttl_seconds=settings.cache_ttl_seconds,
@@ -164,18 +183,18 @@ class AppState:
 # --------------------------------------------------------------------------- #
 
 
-def _validate_url(url: str, settings: Settings) -> None:
-    if not url:
-        raise ValueError("missing 'url' query parameter")
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError("url must use http or https")
-    if not parsed.hostname:
-        raise ValueError("url has no hostname")
-    if settings.allowed_hosts and parsed.hostname.lower() not in {
-        h.lower() for h in settings.allowed_hosts
-    }:
-        raise ValueError(f"host '{parsed.hostname}' is not allowed")
+def _validate_url(url: str, state: AppState) -> None:
+    """Validate the URL, enforcing the SSRF deny-list.
+
+    Raises ``SSRFError`` for blocked addresses (private/loopback/metadata),
+    and ``ValueError`` for malformed input. Both become HTTP 400/422 in the
+    handler, but SSRF is logged at WARNING for monitoring.
+    """
+    try:
+        state.url_validator.validate(url)
+    except SSRFError:
+        logger.warning("SSRF blocked (digest=%s)", state.cache.mask(state.cache.key_for(url)))
+        raise
 
 
 class _ConvertHTTPError(Exception):
@@ -250,7 +269,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Prefer settings attached by create_app(); fall back to env-derived defaults.
     settings: Settings = getattr(app.state, "settings", None) or _default_settings()
     configure_logging(settings.log_level)
-    state = AppState(settings)
+    # Optional injected URL validator (tests pass a no-resolve one).
+    url_validator: UrlValidator | None = getattr(app.state, "url_validator", None)
+    state = AppState(settings, url_validator=url_validator)
     app.state.app_state = state
     logger.info(
         "startup complete (workers hint=%d, cache_ttl=%ds)",
@@ -264,7 +285,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("shutdown complete")
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    url_validator: UrlValidator | None = None,
+) -> FastAPI:
     s = settings or _default_settings()
     app_obj = FastAPI(
         title="subscription-converter",
@@ -273,7 +298,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redoc_url=None,
         lifespan=lifespan,
     )
-    # Attach settings so the lifespan can use the caller-provided configuration
+    # Attach settings + optional validator so the lifespan can use them.
+    app_obj.state.url_validator = url_validator
     # (dependency injection) rather than always reading env-derived defaults.
     app_obj.state.settings = s
     app_obj.include_router(router)
@@ -326,7 +352,10 @@ async def _convert_endpoint(
 
     try:
         url = normalize_subscription_url(raw_url)
-        _validate_url(url, state.settings)
+        _validate_url(url, state)
+    except SSRFError:
+        # Deliberately generic message — never echo the blocked host back.
+        return PlainTextResponse("url rejected: blocked address", status_code=422)
     except (ValueError, InvalidSubscriptionURL) as exc:
         return PlainTextResponse(f"invalid request: {exc}", status_code=400)
 
@@ -341,19 +370,24 @@ async def _convert_endpoint(
     except TimeoutError:
         return PlainTextResponse("conversion failed: upstream fetch timed out", status_code=504)
     except Exception as exc:  # never crash the process
-        logger.exception("unexpected error: %s", exc.__class__.__name__)
+        # NOTE: do NOT use logger.exception here — the traceback can embed the
+        # upstream URL (with credentials) inside httpx/anyio exception messages.
+        logger.warning("unexpected error: %s", exc.__class__.__name__)
         return PlainTextResponse(
             f"conversion failed: unexpected {exc.__class__.__name__}", status_code=400
         )
 
-    update_interval_h = subscription.profile_update_interval or max(
-        state.settings.cache_ttl_seconds // 60, 1
-    )
+    # Profile-Update-Interval is in HOURS per the Clash/Mihomo convention
+    # (and Subscription.profile_update_interval). The fallback must also be in
+    # hours: cache_ttl_seconds // 3600, clamped to >= 1 so clients poll at least
+    # hourly. (B4: previously divided by 60 — minutes — causing 60x under-refresh.)
+    fallback_hours = max(state.settings.cache_ttl_seconds // 3600, 1)
+    update_interval_h = subscription.profile_update_interval or fallback_hours
     headers = {
         "Cache-Control": f"public, max-age={state.settings.cache_ttl_seconds}",
         "X-Subscription-Fetched-At": subscription.fetched_at_iso,
         "Subscription-Userinfo": subscription.subscription_userinfo,
-        "Profile-Update-Interval": str(update_interval_h if update_interval_h >= 1 else 1),
+        "Profile-Update-Interval": str(max(update_interval_h, 1)),
     }
     return Response(content=rendered, media_type=media_type, headers=headers)
 

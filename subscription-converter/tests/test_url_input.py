@@ -105,7 +105,9 @@ def client(monkeypatch: pytest.MonkeyPatch):
         return self.parse_text(SS_LINK)
 
     monkeypatch.setattr(SubscriptionParser, "fetch_and_parse", stub)
-    app = create_app(Settings())
+    from subscription_converter.network_guard import default_url_validator
+
+    app = create_app(Settings(), url_validator=default_url_validator(resolve=False))
     with TestClient(app) as c:
         yield c
 

@@ -126,8 +126,6 @@ def test_parse_text_does_not_log_url(capsys: pytest.CaptureFixture[str]) -> None
     assert "secret" not in out.out + out.err
 
 
-def test_fetch_rejects_non_http_url(parser: SubscriptionParser) -> None:
+async def test_fetch_rejects_non_http_url(parser: SubscriptionParser) -> None:
     with pytest.raises(SubscriptionFetchError):
-        import asyncio
-
-        asyncio.get_event_loop().run_until_complete(parser.fetch_async("ftp://nope"))
+        await parser.fetch_async("ftp://nope")
