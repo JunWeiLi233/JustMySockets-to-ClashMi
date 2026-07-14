@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 import httpx
 
 from subscription_converter.models import ProxyNode, Subscription
+from subscription_converter.network_guard import SSRFError, UrlValidator
 from subscription_converter.parser_port import ParserError, ParserRegistry
 from subscription_converter.parsers._helpers import b64decode_loose, looks_like_base64
 
@@ -62,10 +63,16 @@ class SubscriptionParser:
         registry: ParserRegistry,
         user_agent: str,
         timeout: float,
+        url_validator: UrlValidator | None = None,
+        max_response_bytes: int = 8 * 1024 * 1024,
+        max_redirects: int = 3,
     ) -> None:
         self._registry = registry
         self._user_agent = user_agent
         self._timeout = timeout
+        self._url_validator = url_validator
+        self._max_response_bytes = max_response_bytes
+        self._max_redirects = max_redirects
 
     # ------------------------------------------------------------------ #
     # Fetching
@@ -73,23 +80,64 @@ class SubscriptionParser:
     async def fetch_async(self, url: str) -> httpx.Response:
         if not url.startswith(("http://", "https://")):
             raise SubscriptionFetchError("url must use http or https")
+        # Pre-flight SSRF check (also re-run on each redirect by the hook below).
+        if self._url_validator is not None:
+            try:
+                self._url_validator.validate(url)
+            except (SSRFError, ValueError) as exc:
+                raise SubscriptionFetchError(f"url rejected: {exc.__class__.__name__}") from exc
         try:
-            async with httpx.AsyncClient(
+            async with httpx.AsyncClient(  # noqa: SIM117 -- client must exist before .stream()
                 timeout=self._timeout,
                 follow_redirects=True,
+                max_redirects=self._max_redirects,
+                event_hooks={"request": [self._request_hook]},
                 headers={"User-Agent": self._user_agent},
             ) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                return resp
+                # Stream so we can enforce a hard cap on response size (A2).
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    body = await self._read_capped(resp)
+                    # Re-materialize the response with the bounded body so callers
+                    # keep the same .text / .headers interface.
+                    return httpx.Response(
+                        status_code=resp.status_code,
+                        headers=resp.headers,
+                        content=body,
+                        request=resp.request,
+                    )
         except httpx.HTTPStatusError as exc:
             raise SubscriptionFetchError(
                 f"upstream returned HTTP {exc.response.status_code}"
             ) from exc
+        except httpx.TooManyRedirects as exc:
+            raise SubscriptionFetchError("upstream redirected too many times") from exc
         except (httpx.TransportError, httpx.TimeoutException) as exc:
             raise SubscriptionFetchError(
                 f"failed to fetch subscription: {exc.__class__.__name__}"
             ) from exc
+
+    async def _request_hook(self, request: httpx.Request) -> None:
+        """Re-validate every request (including redirect targets) against the SSRF guard."""
+        if self._url_validator is None:
+            return
+        try:
+            self._url_validator.validate(str(request.url))
+        except (SSRFError, ValueError) as exc:
+            raise SubscriptionFetchError(f"url rejected: {exc.__class__.__name__}") from exc
+
+    async def _read_capped(self, resp: httpx.Response) -> bytes:
+        """Read the streaming body up to ``max_response_bytes`` (A2: OOM defence)."""
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > self._max_response_bytes:
+                raise SubscriptionFetchError(
+                    f"upstream body exceeds {self._max_response_bytes} bytes"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     # ------------------------------------------------------------------ #
     # Parsing
@@ -172,7 +220,13 @@ class SubscriptionParser:
         upstream_headers: Mapping[str, str],
     ) -> Subscription:
         safe = _SAFE_UPSTREAM_HEADERS
-        filtered = {k: v for k, v in upstream_headers.items() if k.lower() in safe}
+        # Strip CR/LF from header values to prevent response-header injection
+        # if these are later echoed back to the client (A5).
+        filtered = {
+            k: "".join(c for c in v if c not in "\r\n")
+            for k, v in upstream_headers.items()
+            if k.lower() in safe
+        }
         now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         _ = time.monotonic()  # reserved for future age-based cache logic
         return Subscription(
