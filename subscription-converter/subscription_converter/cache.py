@@ -3,9 +3,11 @@
 The cache key is derived from the subscription URL via HMAC-SHA256 using a
 per-process random key. This means:
 
-* We never store the raw URL (or any password embedded in it) in memory in a
-  form that can be leaked via a heap dump / debug log.
+* Raw URLs are never used as cache keys or written to logs.
 * We never log the URL — only a short, un-reversible digest.
+
+Cached values can contain parsed proxy credentials. They are therefore purged
+at expiry and cleared during application shutdown; they are never persisted.
 """
 
 from __future__ import annotations
@@ -62,12 +64,9 @@ class TTLCache(Generic[T]):
         key = self.key_for(url)
         now = time.monotonic()
         with self._lock:
+            self._purge_expired_locked(now)
             entry = self._store.get(key)
             if entry is None:
-                return None
-            if entry.expires_at <= now:
-                self._store.pop(key, None)
-                logger.debug("cache miss (expired) key=%s", self.mask(key))
                 return None
             self._store.move_to_end(key)
             logger.debug("cache hit key=%s", self.mask(key))
@@ -77,6 +76,7 @@ class TTLCache(Generic[T]):
         key = self.key_for(url)
         now = time.monotonic()
         with self._lock:
+            self._purge_expired_locked(now)
             while len(self._store) >= self._max:
                 self._store.popitem(last=False)
             self._store[key] = _Entry(value=value, expires_at=now + self._ttl)
@@ -92,8 +92,24 @@ class TTLCache(Generic[T]):
             self._store.clear()
 
     def size(self) -> int:
+        now = time.monotonic()
         with self._lock:
+            self._purge_expired_locked(now)
             return len(self._store)
+
+    def purge_expired(self) -> int:
+        """Remove all expired values and return the number purged."""
+        now = time.monotonic()
+        with self._lock:
+            return self._purge_expired_locked(now)
+
+    def _purge_expired_locked(self, now: float) -> int:
+        expired = [key for key, entry in self._store.items() if entry.expires_at <= now]
+        for key in expired:
+            self._store.pop(key, None)
+        if expired:
+            logger.debug("purged expired cache entries count=%d", len(expired))
+        return len(expired)
 
     def get_or_set(self, url: str, factory: Callable[[], T]) -> T:
         """Return the cached value or compute via ``factory`` and cache it.

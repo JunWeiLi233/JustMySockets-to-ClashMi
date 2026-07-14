@@ -37,27 +37,28 @@ cd JustMySockets-to-ClashMi
 docker compose up -d --build
 ```
 
-The service now listens on `http://localhost:8000`.
+The service now listens on `http://localhost:8000`. Open that address in a
+browser, paste the original subscription link, click **Generate secure link**,
+and copy the result into Clash Mi. The page performs URL encoding locally, so
+there is no Terminal command or online encoder to use.
 
-Subscribe in your Clash client using:
+For manual/API use, the generated URL has this shape:
 
 ```
 http://<your-host>:8000/clash?url=<URL-encoded subscription URL>
 ```
 
-> **Tip — what is a "URL-encoded subscription URL"?**
+> **What is a "URL-encoded subscription URL"?**
 > Subscription URLs contain characters like `?`, `&`, `=` that break HTTP query
-> strings. You must URL-encode the whole subscription URL before pasting it
-> after `?url=`. For example:
+> strings. The web interface handles this automatically. If you construct the
+> URL manually, encode the entire upstream URL before placing it after `?url=`.
+> For example:
 > ```
 > # raw
 > https://jmssub.net/getsub.php?sid=1&token=abc
 > # URL-encoded (paste this after ?url=)
 > https%3A%2F%2Fjmssub.net%2Fgetsub.php%3Fsid%3D1%26token%3Dabc
 > ```
-> Many tools can do this: `python -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "<url>"`
-> or any online "URL encoder".
-
 That's it — your Clash client will now pull a valid config every time it refreshes.
 
 ---
@@ -102,8 +103,7 @@ uvicorn subscription_converter.app:app --host 0.0.0.0 --port 8000
 ```
 
 You should see `Uvicorn running on http://0.0.0.0:8000`. Open
-`http://localhost:8000/` in a browser — it should say
-`Subscription Converter Running`.
+`http://localhost:8000/` in a browser to use the private link builder.
 
 ### 2.3 (Optional) Development dependencies
 
@@ -193,12 +193,13 @@ This is the key production behavior:
 
 | Method | Path        | Description                              | Content-Type       |
 |--------|-------------|------------------------------------------|--------------------|
-| GET    | `/`         | Health string `Subscription Converter Running` | `text/plain` |
+| GET    | `/`         | Private browser UI for generating a client URL | `text/html` |
 | GET    | `/health`   | JSON health + cache size                 | `application/json` |
 | GET    | `/clash`    | **Mihomo / Clash Meta YAML** (main use)  | `application/yaml` |
 | GET    | `/surge`    | Surge config (same parser)               | `text/plain`       |
 | GET    | `/sing-box` | sing-box JSON (same parser)              | `application/json` |
-| GET    | `/docs`     | Interactive API docs (Swagger UI)        | `text/html`        |
+| POST   | `/api/check`| Private same-origin connection check     | `application/json` |
+| GET    | `/docs`     | Swagger UI when `ENABLE_DOCS=true`       | `text/html`        |
 
 All conversion endpoints (`/clash`, `/surge`, `/sing-box`) take:
 
@@ -243,6 +244,7 @@ All settings are **environment variables**. You can set them before running
 | `DNS_FAKE_IP_RANGE`       | `198.18.0.1/16`                      | fake-ip CIDR range for the generated DNS block.                        |
 | `DNS_IPV6`                | `false`                              | Enable IPv6 DNS in the generated config.                               |
 | `LOG_LEVEL`               | `INFO`                               | Logging verbosity (`DEBUG`/`INFO`/`WARNING`/`ERROR`).                  |
+| `ENABLE_DOCS`             | `false`                              | Expose Swagger/OpenAPI docs. Disabled by default to reduce public attack surface. |
 | `ALLOWED_HOSTS`           | *(empty = all allowed)*              | Comma-separated allow-list of upstream hostnames (SSRF defence).        |
 
 **Example — set a config via environment variables (no Docker):**
@@ -262,8 +264,15 @@ credentials). Key safeguards:
 
 - **Subscription URLs and passwords are NEVER logged.** A process-wide logging
   filter redacts any `url=...` value before it reaches any log handler.
-- **The cache stores HMAC digests of URLs**, never raw URLs. The HMAC key is
-  random per-process, so even a memory dump can't recover the URLs.
+- **The browser UI has no analytics, third-party assets, cookies, or browser
+  storage.** Link generation happens locally; the URL is sent only after the
+  user explicitly checks it or a client requests the generated endpoint.
+- **Rendered configurations are `private, no-store`.** Shared caches, CDNs, and
+  browser caches are instructed not to retain proxy credentials.
+- **Cache lookup keys are HMAC digests**, never raw URLs. Parsed nodes are held
+  only in process memory until the configured TTL expires; nothing is persisted.
+- **Strict browser headers** enforce a nonce-based CSP, no referrers, no framing,
+  no MIME sniffing, and no access to camera/location/microphone APIs.
 - **The Docker container runs as a non-root user** (uid 1001).
 - **`ALLOWED_HOSTS`** restricts which upstream providers may be contacted
   (defence-in-depth against SSRF via the `?url=` parameter).
@@ -383,26 +392,26 @@ cd JustMySockets-to-ClashMi
 docker compose up -d --build
 ```
 
-服务现在监听 `http://localhost:8000`。
+服务现在监听 `http://localhost:8000`。用浏览器打开此地址,粘贴原始订阅地址,
+点击 **Generate secure link**,然后把生成结果复制到 Clash Mi。网页会在本地完成
+URL 编码,不需要终端命令或在线编码网站。
 
-在 Clash 客户端中使用以下地址订阅:
+手动/API 使用时,生成地址的格式为:
 
 ```
 http://<你的主机>:8000/clash?url=<URL 编码后的订阅地址>
 ```
 
-> **小贴士 —— 什么是"URL 编码后的订阅地址"?**
+> **什么是"URL 编码后的订阅地址"?**
 > 订阅地址里含有 `?`、`&`、`=` 等字符,会破坏 HTTP 查询字符串。你必须先把整
-> 个订阅地址做 URL 编码,再粘贴到 `?url=` 后面。例如:
+> 个订阅地址做 URL 编码,再粘贴到 `?url=` 后面。网页界面会自动完成此操作。
+> 手动构造时例如:
 > ```
 > # 原始
 > https://jmssub.net/getsub.php?sid=1&token=abc
 > # URL 编码后(粘贴到 ?url= 后面)
 > https%3A%2F%2Fjmssub.net%2Fgetsub.php%3Fsid%3D1%26token%3Dabc
 > ```
-> 编码方法:`python -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "<地址>"`
-> 或任意在线"URL 编码"工具。
-
 完成 —— 你的 Clash 客户端每次刷新都会拉取一份有效配置。
 
 ---
@@ -446,7 +455,7 @@ uvicorn subscription_converter.app:app --host 0.0.0.0 --port 8000
 ```
 
 你会看到 `Uvicorn running on http://0.0.0.0:8000`。用浏览器打开
-`http://localhost:8000/`,应显示 `Subscription Converter Running`。
+`http://localhost:8000/` 即可使用私密订阅地址生成界面。
 
 ### 2.3 (可选)开发依赖
 
@@ -530,12 +539,13 @@ pip install -r requirements-dev.txt
 
 | 方法 | 路径        | 说明                                    | Content-Type       |
 |------|-------------|-----------------------------------------|--------------------|
-| GET  | `/`         | 健康检查字符串 `Subscription Converter Running` | `text/plain` |
+| GET  | `/`         | 用于生成客户端订阅地址的隐私网页界面      | `text/html` |
 | GET  | `/health`   | JSON 健康状态 + 缓存大小                | `application/json` |
 | GET  | `/clash`    | **Mihomo / Clash Meta YAML**(主要用途) | `application/yaml` |
 | GET  | `/surge`    | Surge 配置(同一解析器)                | `text/plain`       |
 | GET  | `/sing-box` | sing-box JSON(同一解析器)             | `application/json` |
-| GET  | `/docs`     | 交互式 API 文档(Swagger UI)           | `text/html`        |
+| POST | `/api/check`| 同源私密连接检查                        | `application/json` |
+| GET  | `/docs`     | `ENABLE_DOCS=true` 时的 Swagger UI     | `text/html`        |
 
 所有转换接口(`/clash`、`/surge`、`/sing-box`)都接受:
 
@@ -580,6 +590,7 @@ curl http://localhost:8000/health
 | `DNS_FAKE_IP_RANGE`       | `198.18.0.1/16`                      | 生成 DNS 块的 fake-ip CIDR 范围。                        |
 | `DNS_IPV6`                | `false`                              | 是否在生成配置中启用 IPv6 DNS。                          |
 | `LOG_LEVEL`               | `INFO`                               | 日志级别(`DEBUG`/`INFO`/`WARNING`/`ERROR`)。            |
+| `ENABLE_DOCS`             | `false`                              | 是否公开 Swagger/OpenAPI 文档。默认关闭以缩小攻击面。    |
 | `ALLOWED_HOSTS`           | *(空 = 全部允许)*                    | 允许的上游主机名白名单(逗号分隔,防 SSRF)。             |
 
 **示例 —— 用环境变量配置(无 Docker):**
@@ -598,8 +609,14 @@ uvicorn subscription_converter.app:app --host 0.0.0.0 --port 9000
 
 - **订阅地址和密码绝不写入日志。** 进程级的日志过滤器会在任何日志处理器收到
   记录前,抹除所有 `url=...` 的值。
-- **缓存只存 URL 的 HMAC 摘要**,不存原始 URL。HMAC 密钥每个进程随机生成,
-  即使内存转储也无法还原地址。
+- **网页界面不包含分析、第三方资源、Cookie 或浏览器存储。** 订阅地址仅在浏览
+  器本地生成;只有用户主动检查或客户端请求生成接口时才发送。
+- **生成配置使用 `private, no-store`。** 共享缓存、CDN 和浏览器缓存不得保留
+  代理凭据。
+- **缓存查找键只存 URL 的 HMAC 摘要**,不存原始 URL。解析后的节点只在进程
+  内存中保留到 TTL 到期,不会持久化。
+- **严格浏览器安全响应头**包含 nonce CSP、禁止 referrer、禁止 iframe、禁止
+  MIME 猜测及禁用相机/定位/麦克风等权限。
 - **Docker 容器以非 root 用户运行**(uid 1001)。
 - **`ALLOWED_HOSTS`** 限制可访问哪些上游供应商(防 SSRF 的纵深防御)。
 

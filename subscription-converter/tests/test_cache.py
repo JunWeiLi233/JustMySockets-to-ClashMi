@@ -25,6 +25,15 @@ def test_get_returns_none_after_expiry() -> None:
     assert cache.get("u") is None
 
 
+def test_size_purges_all_expired_values() -> None:
+    cache: TTLCache[str] = TTLCache(ttl_seconds=1, max_entries=10)
+    cache.set("u1", "credential-1")
+    cache.set("u2", "credential-2")
+    time.sleep(1.1)
+    assert cache.size() == 0
+    assert cache.purge_expired() == 0
+
+
 def test_invalidate() -> None:
     cache: TTLCache[str] = TTLCache(ttl_seconds=60, max_entries=10)
     cache.set("u", "v")

@@ -25,6 +25,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
                 "TEST_",
                 "DNS_",
                 "LOG_LEVEL",
+                "ENABLE_DOCS",
                 "ALLOWED_HOSTS",
             )
         ):
@@ -41,6 +42,7 @@ def test_defaults() -> None:
     assert s.test_url == "https://www.gstatic.com/generate_204"
     assert "https://dns.alidns.com/dns-query" in s.dns_nameserver
     assert s.dns_ipv6 is False
+    assert s.enable_docs is False
     assert s.allowed_hosts == ()
 
 
@@ -48,12 +50,14 @@ def test_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PORT", "9000")
     monkeypatch.setenv("CACHE_TTL_SECONDS", "120")
     monkeypatch.setenv("DNS_IPV6", "true")
+    monkeypatch.setenv("ENABLE_DOCS", "yes")
     monkeypatch.setenv("ALLOWED_HOSTS", "a.com,b.com")
     monkeypatch.setenv("DNS_NAMESERVER", "https://x.example/dns-query,https://y.example/dns-query")
     s = Settings()
     assert s.port == 9000
     assert s.cache_ttl_seconds == 120
     assert s.dns_ipv6 is True
+    assert s.enable_docs is True
     assert s.allowed_hosts == ("a.com", "b.com")
     assert s.dns_nameserver == ("https://x.example/dns-query", "https://y.example/dns-query")
 

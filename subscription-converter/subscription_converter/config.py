@@ -110,6 +110,7 @@ class Settings:
 
     # Misc
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO").upper())
+    enable_docs: bool = field(default_factory=lambda: _as_bool("ENABLE_DOCS", False))
     allowed_hosts: tuple[str, ...] = field(
         default_factory=lambda: tuple(
             h.strip() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()

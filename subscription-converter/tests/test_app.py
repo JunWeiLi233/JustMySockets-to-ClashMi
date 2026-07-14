@@ -58,7 +58,27 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 def test_root(client: TestClient) -> None:
     r = client.get("/")
     assert r.status_code == 200
-    assert r.text.strip() == "Subscription Converter Running"
+    assert r.headers["content-type"].startswith("text/html")
+    assert "JMS Config Bridge" in r.text
+    assert "Generate secure link" in r.text
+    assert "https://sub.example.com" not in r.text
+
+
+def test_root_has_strict_privacy_headers(client: TestClient) -> None:
+    r = client.get("/")
+    csp = r.headers["content-security-policy"]
+    assert "default-src 'none'" in csp
+    assert "connect-src 'self'" in csp
+    assert "unsafe-inline" not in csp
+    assert r.headers["cache-control"] == "private, no-store, max-age=0"
+    assert r.headers["referrer-policy"] == "no-referrer"
+    assert r.headers["x-frame-options"] == "DENY"
+    assert r.headers["x-content-type-options"] == "nosniff"
+
+
+def test_docs_are_disabled_by_default(client: TestClient) -> None:
+    assert client.get("/docs").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
 
 
 def test_health(client: TestClient) -> None:
@@ -78,6 +98,40 @@ def test_clash_returns_yaml(client: TestClient) -> None:
     assert "proxies" in doc and len(doc["proxies"]) >= 2
     # freshness header present
     assert r.headers.get("X-Subscription-Fetched-At", "").endswith("Z")
+    assert r.headers["cache-control"] == "private, no-store, max-age=0"
+    assert r.headers["pragma"] == "no-cache"
+
+
+def test_private_check_returns_metadata_only(client: TestClient) -> None:
+    r = client.post(
+        "/api/check",
+        json={"url": SUB_URL, "format": "clash", "force_refresh": True},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+    assert r.json()["nodes"] == 2
+    assert SUB_URL not in r.text
+    assert "proxies" not in r.text
+    assert r.headers["cache-control"] == "private, no-store, max-age=0"
+
+
+def test_private_check_requires_https(client: TestClient) -> None:
+    r = client.post(
+        "/api/check",
+        json={"url": "http://sub.example.com/getsub", "format": "clash"},
+    )
+    assert r.status_code == 400
+    assert r.json()["message"] == "an HTTPS subscription URL is required"
+
+
+def test_private_check_rejects_cross_site_browser_requests(client: TestClient) -> None:
+    r = client.post(
+        "/api/check",
+        headers={"Sec-Fetch-Site": "cross-site"},
+        json={"url": SUB_URL, "format": "clash"},
+    )
+    assert r.status_code == 403
+    assert r.json()["message"] == "cross-site checks are not allowed"
 
 
 def test_clash_caches_upstream(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

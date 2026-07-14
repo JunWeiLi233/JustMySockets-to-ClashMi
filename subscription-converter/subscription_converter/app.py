@@ -2,8 +2,9 @@
 
 Endpoints
 ---------
-* ``GET /``           -> health string ``Subscription Converter Running``
+* ``GET /``           -> private browser UI for building client URLs
 * ``GET /health``     -> JSON health + cache size
+* ``POST /api/check`` -> private same-origin subscription validation
 * ``GET /clash``      -> Mihomo / Clash Meta YAML (``application/yaml``)
 * ``GET /surge``      -> Surge config (placeholder renderer, same pipeline)
 * ``GET /sing-box``   -> sing-box JSON (placeholder renderer, same pipeline)
@@ -25,19 +26,22 @@ import asyncio
 import logging
 import os
 import re
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import secrets
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
 from functools import lru_cache
-from typing import Final
+from typing import Final, Literal
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 
 from subscription_converter.cache import TTLCache
 from subscription_converter.config import Settings
 from subscription_converter.converter_registry import get_converter
 from subscription_converter.converters import BaseConverter, ConversionError
 from subscription_converter.converters.mihomo import MihomoConverter
+from subscription_converter.frontend import render_frontend
 from subscription_converter.models import Subscription
 from subscription_converter.network_guard import SSRFError, UrlValidator, default_url_validator
 from subscription_converter.parser_port import ParserRegistry
@@ -62,6 +66,10 @@ router = APIRouter()
 
 # Upstream response headers we surface to clients (lowercased).
 _USERINFO_HEADER: Final[str] = "subscription-userinfo"
+_NO_STORE: Final[str] = "private, no-store, max-age=0"
+_PERMISSIONS_POLICY: Final[str] = (
+    "accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -205,6 +213,16 @@ class _ConvertHTTPError(Exception):
         super().__init__(message)
 
 
+class _CheckRequest(BaseModel):
+    """Small, strict body accepted by the same-origin connection checker."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    url: str = Field(min_length=1, max_length=4096)
+    format: Literal["clash", "sing-box", "surge"] = "clash"
+    force_refresh: bool = False
+
+
 # --------------------------------------------------------------------------- #
 # Core: cached fetch + dynamic render
 # --------------------------------------------------------------------------- #
@@ -273,6 +291,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     url_validator: UrlValidator | None = getattr(app.state, "url_validator", None)
     state = AppState(settings, url_validator=url_validator)
     app.state.app_state = state
+    purge_task = asyncio.create_task(_purge_expired_cache(state))
     logger.info(
         "startup complete (workers hint=%d, cache_ttl=%ds)",
         settings.workers,
@@ -281,8 +300,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        purge_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await purge_task
+        state.cache.clear()
         app.state.app_state = None
         logger.info("shutdown complete")
+
+
+async def _purge_expired_cache(state: AppState) -> None:
+    """Bound how long parsed proxy credentials remain in process memory."""
+    interval = max(1, min(state.settings.cache_ttl_seconds, 60))
+    while True:
+        await asyncio.sleep(interval)
+        state.cache.purge_expired()
 
 
 def create_app(
@@ -294,10 +325,30 @@ def create_app(
     app_obj = FastAPI(
         title="subscription-converter",
         version="0.1.0",
-        docs_url="/docs",
+        docs_url="/docs" if s.enable_docs else None,
         redoc_url=None,
+        openapi_url="/openapi.json" if s.enable_docs else None,
         lifespan=lifespan,
     )
+
+    @app_obj.middleware("http")
+    async def security_headers(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        """Apply safe browser defaults without changing conversion semantics."""
+        response = await call_next(request)
+        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        response.headers["Permissions-Policy"] = _PERMISSIONS_POLICY
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+        return response
+
     # Attach settings + optional validator so the lifespan can use them.
     app_obj.state.url_validator = url_validator
     # (dependency injection) rather than always reading env-derived defaults.
@@ -321,14 +372,79 @@ def _state(request: Request) -> AppState:
 
 
 @router.get("/")
-async def root() -> PlainTextResponse:
-    return PlainTextResponse("Subscription Converter Running")
+async def root() -> HTMLResponse:
+    nonce = secrets.token_urlsafe(24)
+    csp = (
+        "default-src 'none'; "
+        f"style-src 'nonce-{nonce}'; "
+        f"script-src 'nonce-{nonce}'; "
+        "connect-src 'self'; img-src 'self' data:; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'"
+    )
+    return HTMLResponse(
+        render_frontend(nonce=nonce),
+        headers={
+            "Cache-Control": _NO_STORE,
+            "Content-Security-Policy": csp,
+            "Pragma": "no-cache",
+        },
+    )
 
 
 @router.get("/health")
 async def health(request: Request) -> dict[str, object]:
     state = _state(request)
     return {"status": "ok", "cache_size": state.cache.size()}
+
+
+def _check_error(message: str, *, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(
+        {"status": "error", "message": message},
+        status_code=status_code,
+        headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
+    )
+
+
+@router.post("/api/check")
+async def check_subscription(request: Request, payload: _CheckRequest) -> JSONResponse:
+    """Validate and render a subscription without placing its URL in request logs."""
+    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        return _check_error("cross-site checks are not allowed", status_code=403)
+
+    state = _state(request)
+    try:
+        url = normalize_subscription_url(payload.url)
+        if not url.lower().startswith("https://"):
+            return _check_error("an HTTPS subscription URL is required")
+        _validate_url(url, state)
+    except SSRFError:
+        return _check_error("url rejected: blocked address", status_code=422)
+    except (ValueError, InvalidSubscriptionURL) as exc:
+        return _check_error(f"invalid request: {exc}")
+
+    try:
+        subscription = await asyncio.wait_for(
+            _fetch_subscription(state, url, force_refresh=payload.force_refresh),
+            timeout=state.settings.fetch_timeout_seconds + 5,
+        )
+        _render_format(state, payload.format, subscription)
+    except _ConvertHTTPError as exc:
+        return _check_error(f"conversion failed: {exc.message}")
+    except TimeoutError:
+        return _check_error("conversion failed: upstream fetch timed out", status_code=504)
+    except Exception as exc:
+        logger.warning("unexpected check error: %s", exc.__class__.__name__)
+        return _check_error(f"conversion failed: unexpected {exc.__class__.__name__}")
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "nodes": len(subscription.nodes),
+            "format": payload.format,
+            "fetched_at": subscription.fetched_at_iso,
+        },
+        headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
+    )
 
 
 async def _convert_endpoint(
@@ -384,7 +500,10 @@ async def _convert_endpoint(
     fallback_hours = max(state.settings.cache_ttl_seconds // 3600, 1)
     update_interval_h = subscription.profile_update_interval or fallback_hours
     headers = {
-        "Cache-Control": f"public, max-age={state.settings.cache_ttl_seconds}",
+        # Proxy configs contain credentials. Never allow a shared cache, CDN,
+        # browser history cache, or intermediary to retain the rendered body.
+        "Cache-Control": _NO_STORE,
+        "Pragma": "no-cache",
         "X-Subscription-Fetched-At": subscription.fetched_at_iso,
         "Subscription-Userinfo": subscription.subscription_userinfo,
         "Profile-Update-Interval": str(max(update_interval_h, 1)),
