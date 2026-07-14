@@ -7,6 +7,7 @@ Endpoints
 * ``POST /api/check`` -> private same-origin subscription validation
 * ``POST /api/links`` -> encrypted durable link creation
 * ``POST /api/links/close`` -> permanent closure by private management key
+* ``GET /admin``      -> one-browser, pseudonymous operations dashboard
 * ``GET /s/{token}``  -> config through an opaque durable access token
 * ``GET /clash``      -> Mihomo / Clash Meta YAML (``application/yaml``)
 * ``GET /surge``      -> Surge config (placeholder renderer, same pipeline)
@@ -26,12 +27,15 @@ URLs use authenticated encryption; cache and database lookups use HMAC digests.
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
 import logging
 import os
 import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Final, Literal
 from urllib.parse import urlsplit
@@ -40,6 +44,10 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from subscription_converter.admin_frontend import (
+    render_admin_dashboard,
+    render_admin_enrollment,
+)
 from subscription_converter.cache import TTLCache
 from subscription_converter.config import Settings
 from subscription_converter.converter_registry import get_converter
@@ -52,11 +60,14 @@ from subscription_converter.link_store import (
     LinkStore,
     LinkStoreConfigurationError,
     LinkStoreCorruptionError,
+    NetworkLimitReached,
+    UserLimitReached,
 )
 from subscription_converter.models import Subscription
 from subscription_converter.network_guard import SSRFError, UrlValidator, default_url_validator
 from subscription_converter.parser_port import ParserRegistry
 from subscription_converter.parsers import default_registry
+from subscription_converter.rate_limit import SlidingWindowRateLimiter
 from subscription_converter.subscription_parser import (
     SubscriptionFetchError,
     SubscriptionParseError,
@@ -78,6 +89,9 @@ router = APIRouter()
 # Upstream response headers we surface to clients (lowercased).
 _USERINFO_HEADER: Final[str] = "subscription-userinfo"
 _NO_STORE: Final[str] = "private, no-store, max-age=0"
+_CLIENT_COOKIE: Final[str] = "jms_client_device"
+_ADMIN_COOKIE: Final[str] = "jms_admin_device"
+_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _PERMISSIONS_POLICY: Final[str] = (
     "accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()"
 )
@@ -100,6 +114,7 @@ class _MaskingFilter(logging.Filter):
     4. Opaque access tokens in ``/s/<token>`` request paths.
     """
 
+    _URL_PARAM_RE = re.compile(r"(?i)(\burl=)[^\s'\"]+")
     _URL_RE = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
     _SECRET_RE = re.compile(r"(?i)(token|password|passwd|secret|key|auth|uuid|sid|id)=\S+")
     _STABLE_PATH_RE = re.compile(r"(?i)(/s/)[A-Za-z0-9_-]{32,128}")
@@ -116,6 +131,7 @@ class _MaskingFilter(logging.Filter):
         return True
 
     def _redact(self, text: str) -> str:
+        text = self._URL_PARAM_RE.sub(r"\1<redacted>", text)
         text = self._URL_RE.sub("<redacted-url>", text)
         text = self._SECRET_RE.sub(lambda m: m.group(1) + "=<redacted>", text)
         text = self._STABLE_PATH_RE.sub(r"\1<redacted-token>", text)
@@ -168,6 +184,7 @@ class AppState:
         url_validator: UrlValidator | None = None,
     ) -> None:
         self.settings = settings
+        self._validate_identity_settings(settings)
         self.registry: ParserRegistry = default_registry()
         # Production resolves DNS to block SSRF; tests inject a no-resolve validator.
         self.url_validator = url_validator or default_url_validator(settings.allowed_hosts)
@@ -181,14 +198,18 @@ class AppState:
             ttl_seconds=settings.cache_ttl_seconds,
             max_entries=settings.cache_max_entries,
         )
+        self.rate_limiter = SlidingWindowRateLimiter()
         self.link_store: LinkStore | None = None
         if settings.persistent_links_enabled:
             self._validate_public_base_url(settings.public_base_url)
+            self._validate_admin_bootstrap_secret(settings.admin_bootstrap_secret)
             self.link_store = LinkStore(
                 settings.link_database_path,
                 settings.link_secret_key,
                 max_active_links=settings.max_active_links,
                 max_links_per_source=settings.max_links_per_source,
+                max_links_per_user=settings.max_links_per_user,
+                max_links_per_network=settings.max_links_per_network,
             )
 
     @staticmethod
@@ -210,6 +231,34 @@ class AppState:
                 "PUBLIC_BASE_URL must be an origin without credentials, path, or query"
             )
 
+    @staticmethod
+    def _validate_admin_bootstrap_secret(value: str) -> None:
+        if value and _TOKEN_RE.fullmatch(value) is None:
+            raise LinkStoreConfigurationError(
+                "ADMIN_BOOTSTRAP_SECRET must be an unpadded URL-safe base64 32-byte token"
+            )
+
+    @staticmethod
+    def _validate_identity_settings(settings: Settings) -> None:
+        positive_values = {
+            "CLIENT_COOKIE_MAX_AGE_SECONDS": settings.client_cookie_max_age_seconds,
+            "ADMIN_COOKIE_MAX_AGE_SECONDS": settings.admin_cookie_max_age_seconds,
+            "CHECK_RATE_LIMIT": settings.check_rate_limit,
+            "CHECK_RATE_WINDOW_SECONDS": settings.check_rate_window_seconds,
+            "CREATE_RATE_LIMIT": settings.create_rate_limit,
+            "CREATE_RATE_WINDOW_SECONDS": settings.create_rate_window_seconds,
+            "CLOSE_RATE_LIMIT": settings.close_rate_limit,
+            "CLOSE_RATE_WINDOW_SECONDS": settings.close_rate_window_seconds,
+            "ADMIN_ENROLL_RATE_LIMIT": settings.admin_enroll_rate_limit,
+            "ADMIN_ENROLL_RATE_WINDOW_SECONDS": settings.admin_enroll_rate_window_seconds,
+        }
+        invalid = next((name for name, value in positive_values.items() if value <= 0), None)
+        if invalid is not None:
+            raise LinkStoreConfigurationError(f"{invalid} must be positive")
+        header = settings.trusted_client_ip_header
+        if header and re.fullmatch(r"[A-Za-z0-9-]+", header) is None:
+            raise LinkStoreConfigurationError("TRUSTED_CLIENT_IP_HEADER is invalid")
+
     def make_converter(self, fmt: str) -> BaseConverter:
         if fmt in {"clash", "mihomo"}:
             return MihomoConverter(
@@ -226,6 +275,93 @@ class AppState:
             test_url=self.settings.test_url,
             test_interval=self.settings.test_interval,
         )
+
+
+@dataclass(frozen=True)
+class _ClientIdentity:
+    owner_token: str
+    network_identity: str
+    is_new: bool
+
+
+def _network_identity(request: Request, settings: Settings) -> str:
+    """Return a canonical address for ephemeral HMAC-based network controls."""
+    candidates: list[str] = []
+    header = settings.trusted_client_ip_header
+    if header:
+        # The operator must opt in only when a trusted edge supplies this
+        # header. Standard forwarding chains put the original client first.
+        candidates.extend(request.headers.get(header, "").split(","))
+    if request.client is not None:
+        candidates.append(request.client.host)
+    for candidate in candidates:
+        try:
+            return ipaddress.ip_address(candidate.strip()).compressed
+        except ValueError:
+            continue
+    return "unavailable"
+
+
+def _client_identity(
+    request: Request, state: AppState, *, create: bool = True
+) -> _ClientIdentity | None:
+    token = request.cookies.get(_CLIENT_COOKIE, "")
+    if _TOKEN_RE.fullmatch(token) is not None:
+        return _ClientIdentity(
+            owner_token=token,
+            network_identity=_network_identity(request, state.settings),
+            is_new=False,
+        )
+    if not create:
+        return None
+    return _ClientIdentity(
+        owner_token=secrets.token_urlsafe(32),
+        network_identity=_network_identity(request, state.settings),
+        is_new=True,
+    )
+
+
+def _cookie_secure(request: Request, state: AppState) -> bool:
+    return request.url.scheme == "https" or state.settings.public_base_url.startswith("https://")
+
+
+def _set_client_cookie(
+    response: Response,
+    request: Request,
+    state: AppState,
+    identity: _ClientIdentity,
+) -> None:
+    if not identity.is_new:
+        return
+    response.set_cookie(
+        _CLIENT_COOKIE,
+        identity.owner_token,
+        max_age=state.settings.client_cookie_max_age_seconds,
+        secure=_cookie_secure(request, state),
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+
+
+def _rate_limit(
+    state: AppState,
+    identity: _ClientIdentity,
+    *,
+    scope: str,
+    limit: int,
+    window_seconds: int,
+) -> int:
+    decision = state.rate_limiter.check(
+        scope,
+        (
+            f"device:{identity.owner_token}",
+            f"network:{identity.network_identity}",
+        ),
+        limit=limit,
+        window_seconds=window_seconds,
+    )
+    return 0 if decision.allowed else decision.retry_after
 
 
 # --------------------------------------------------------------------------- #
@@ -280,6 +416,22 @@ class _CloseLinkRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     manage_key: str = Field(min_length=1, max_length=128)
+
+
+class _AdminEnrollRequest(BaseModel):
+    """Bootstrap secret submitted once in a body, never in a URL."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    bootstrap_secret: str = Field(min_length=1, max_length=128)
+
+
+class _AdminCloseRequest(BaseModel):
+    """Non-bearer database reference accepted by the enrolled admin only."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    link_ref: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
 
 
 # --------------------------------------------------------------------------- #
@@ -430,24 +582,32 @@ def _state(request: Request) -> AppState:
     return state
 
 
-@router.get("/")
-async def root() -> HTMLResponse:
-    nonce = secrets.token_urlsafe(24)
-    csp = (
+def _html_csp(nonce: str) -> str:
+    return (
         "default-src 'none'; "
         f"style-src 'nonce-{nonce}'; "
         f"script-src 'nonce-{nonce}'; "
         "connect-src 'self'; img-src 'self' data:; "
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'"
     )
-    return HTMLResponse(
+
+
+@router.get("/")
+async def root(request: Request) -> HTMLResponse:
+    state = _state(request)
+    identity = _client_identity(request, state)
+    assert identity is not None
+    nonce = secrets.token_urlsafe(24)
+    response = HTMLResponse(
         render_frontend(nonce=nonce),
         headers={
             "Cache-Control": _NO_STORE,
-            "Content-Security-Policy": csp,
+            "Content-Security-Policy": _html_csp(nonce),
             "Pragma": "no-cache",
         },
     )
+    _set_client_cookie(response, request, state, identity)
+    return response
 
 
 @router.get("/health")
@@ -506,6 +666,20 @@ async def check_subscription(request: Request, payload: _CheckRequest) -> JSONRe
         return _check_error("cross-site checks are not allowed", status_code=403)
 
     state = _state(request)
+    identity = _client_identity(request, state)
+    assert identity is not None
+    retry_after = _rate_limit(
+        state,
+        identity,
+        scope="check",
+        limit=state.settings.check_rate_limit,
+        window_seconds=state.settings.check_rate_window_seconds,
+    )
+    if retry_after:
+        response = _check_error("too many checks; try again later", status_code=429)
+        response.headers["Retry-After"] = str(retry_after)
+        _set_client_cookie(response, request, state, identity)
+        return response
     try:
         url = normalize_subscription_url(payload.url)
         if not url.lower().startswith("https://"):
@@ -530,7 +704,7 @@ async def check_subscription(request: Request, payload: _CheckRequest) -> JSONRe
         logger.warning("unexpected check error: %s", exc.__class__.__name__)
         return _check_error(f"conversion failed: unexpected {exc.__class__.__name__}")
 
-    return JSONResponse(
+    response = JSONResponse(
         {
             "status": "ok",
             "nodes": len(subscription.nodes),
@@ -539,6 +713,8 @@ async def check_subscription(request: Request, payload: _CheckRequest) -> JSONRe
         },
         headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
     )
+    _set_client_cookie(response, request, state, identity)
+    return response
 
 
 @router.get("/api/capacity")
@@ -582,6 +758,24 @@ async def create_persistent_link(request: Request, payload: _CreateLinkRequest) 
         )
 
     state = _state(request)
+    identity = _client_identity(request, state)
+    assert identity is not None
+    retry_after = _rate_limit(
+        state,
+        identity,
+        scope="create",
+        limit=state.settings.create_rate_limit,
+        window_seconds=state.settings.create_rate_window_seconds,
+    )
+    if retry_after:
+        response = _api_error(
+            "rate_limited",
+            "too many link creation attempts; try again later",
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+        _set_client_cookie(response, request, state, identity)
+        return response
     store = state.link_store
     if store is None:
         return _api_error(
@@ -640,7 +834,13 @@ async def create_persistent_link(request: Request, payload: _CreateLinkRequest) 
         )
 
     try:
-        created = await asyncio.to_thread(store.create, url, payload.format)
+        created = await asyncio.to_thread(
+            store.create,
+            url,
+            payload.format,
+            owner_token=identity.owner_token,
+            network_identity=identity.network_identity,
+        )
     except CapacityReached:
         return _api_error(
             "capacity_reached",
@@ -654,6 +854,19 @@ async def create_persistent_link(request: Request, payload: _CreateLinkRequest) 
             "this subscription already has the maximum number of permanent links",
             status_code=409,
         )
+    except UserLimitReached:
+        return _api_error(
+            "user_limit_reached",
+            "this browser device has the maximum number of active links",
+            status_code=409,
+        )
+    except NetworkLimitReached:
+        return _api_error(
+            "network_limit_reached",
+            "this network has the maximum number of active links",
+            status_code=429,
+            headers={"Retry-After": "3600"},
+        )
     except Exception as exc:
         logger.error("durable link creation failed: %s", exc.__class__.__name__)
         return _api_error(
@@ -664,7 +877,7 @@ async def create_persistent_link(request: Request, payload: _CreateLinkRequest) 
 
     updated_capacity = await asyncio.to_thread(store.capacity)
     base_url = state.settings.public_base_url
-    return JSONResponse(
+    response = JSONResponse(
         {
             "status": "ok",
             "subscription_url": f"{base_url}/s/{created.access_token}",
@@ -678,6 +891,8 @@ async def create_persistent_link(request: Request, payload: _CreateLinkRequest) 
         status_code=201,
         headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
     )
+    _set_client_cookie(response, request, state, identity)
+    return response
 
 
 @router.post("/api/links/close")
@@ -691,6 +906,24 @@ async def close_persistent_link(request: Request, payload: _CloseLinkRequest) ->
         )
 
     state = _state(request)
+    identity = _client_identity(request, state)
+    assert identity is not None
+    retry_after = _rate_limit(
+        state,
+        identity,
+        scope="close",
+        limit=state.settings.close_rate_limit,
+        window_seconds=state.settings.close_rate_window_seconds,
+    )
+    if retry_after:
+        response = _api_error(
+            "rate_limited",
+            "too many link closure attempts; try again later",
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+        _set_client_cookie(response, request, state, identity)
+        return response
     store = state.link_store
     if store is None:
         return _api_error(
@@ -715,8 +948,171 @@ async def close_persistent_link(request: Request, payload: _CloseLinkRequest) ->
         )
     if closed.source_url is not None:
         state.cache.invalidate(closed.source_url)
-    return JSONResponse(
+    response = JSONResponse(
         {"status": "closed", "message": "subscription link permanently closed"},
+        headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
+    )
+    _set_client_cookie(response, request, state, identity)
+    return response
+
+
+def _admin_not_found() -> PlainTextResponse:
+    """Conceal whether an admin route or enrollment exists."""
+    return PlainTextResponse("not found", status_code=404)
+
+
+async def _admin_credentials(
+    request: Request,
+) -> tuple[AppState, LinkStore, _ClientIdentity, str] | None:
+    state = _state(request)
+    store = state.link_store
+    identity = _client_identity(request, state, create=False)
+    device_token = request.cookies.get(_ADMIN_COOKIE, "")
+    if store is None or identity is None or _TOKEN_RE.fullmatch(device_token) is None:
+        return None
+    if not await asyncio.to_thread(
+        store.is_admin_device,
+        device_token,
+        identity.owner_token,
+    ):
+        return None
+    return state, store, identity, device_token
+
+
+@router.get("/admin/enroll")
+async def admin_enrollment_page(request: Request) -> Response:
+    """Expose a one-time form only before any admin browser is enrolled."""
+    state = _state(request)
+    store = state.link_store
+    if (
+        store is None
+        or not state.settings.admin_bootstrap_secret
+        or await asyncio.to_thread(store.admin_enrolled)
+    ):
+        return _admin_not_found()
+    identity = _client_identity(request, state)
+    assert identity is not None
+    nonce = secrets.token_urlsafe(24)
+    response = HTMLResponse(
+        render_admin_enrollment(nonce=nonce),
+        headers={
+            "Cache-Control": _NO_STORE,
+            "Content-Security-Policy": _html_csp(nonce),
+            "Pragma": "no-cache",
+        },
+    )
+    _set_client_cookie(response, request, state, identity)
+    return response
+
+
+@router.post("/api/admin/enroll", status_code=201)
+async def enroll_admin_device(
+    request: Request,
+    payload: _AdminEnrollRequest,
+) -> Response:
+    """Bind the first valid enrollment to this browser profile."""
+    if _is_cross_site_browser(request):
+        return _admin_not_found()
+    state = _state(request)
+    store = state.link_store
+    expected = state.settings.admin_bootstrap_secret
+    if store is None or not expected or await asyncio.to_thread(store.admin_enrolled):
+        return _admin_not_found()
+
+    identity = _client_identity(request, state)
+    assert identity is not None
+    retry_after = _rate_limit(
+        state,
+        identity,
+        scope="admin-enroll",
+        limit=state.settings.admin_enroll_rate_limit,
+        window_seconds=state.settings.admin_enroll_rate_window_seconds,
+    )
+    if retry_after:
+        return PlainTextResponse(
+            "too many requests",
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+    if not hmac.compare_digest(payload.bootstrap_secret, expected):
+        return _admin_not_found()
+
+    device_token = secrets.token_urlsafe(32)
+    enrolled = await asyncio.to_thread(
+        store.enroll_admin_device,
+        device_token,
+        identity.owner_token,
+    )
+    if not enrolled:
+        return _admin_not_found()
+
+    response = JSONResponse(
+        {"status": "enrolled"},
+        status_code=201,
+        headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
+    )
+    _set_client_cookie(response, request, state, identity)
+    response.set_cookie(
+        _ADMIN_COOKIE,
+        device_token,
+        max_age=state.settings.admin_cookie_max_age_seconds,
+        secure=_cookie_secure(request, state),
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+@router.get("/admin")
+async def admin_dashboard(request: Request) -> Response:
+    credentials = await _admin_credentials(request)
+    if credentials is None:
+        return _admin_not_found()
+    _, store, _, device_token = credentials
+    nonce = secrets.token_urlsafe(24)
+    csrf_token = await asyncio.to_thread(store.admin_csrf_token, device_token)
+    return HTMLResponse(
+        render_admin_dashboard(nonce=nonce, csrf_token=csrf_token),
+        headers={
+            "Cache-Control": _NO_STORE,
+            "Content-Security-Policy": _html_csp(nonce),
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@router.get("/api/admin/overview")
+async def admin_overview(request: Request) -> Response:
+    credentials = await _admin_credentials(request)
+    if credentials is None:
+        return _admin_not_found()
+    _, store, _, _ = credentials
+    overview = await asyncio.to_thread(store.admin_overview)
+    return JSONResponse(
+        asdict(overview),
+        headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
+    )
+
+
+@router.post("/api/admin/links/close")
+async def admin_close_link(request: Request, payload: _AdminCloseRequest) -> Response:
+    if _is_cross_site_browser(request):
+        return _admin_not_found()
+    credentials = await _admin_credentials(request)
+    if credentials is None:
+        return _admin_not_found()
+    state, store, _, device_token = credentials
+    csrf_token = request.headers.get("x-admin-csrf", "")
+    if not await asyncio.to_thread(store.verify_admin_csrf, device_token, csrf_token):
+        return PlainTextResponse("invalid request", status_code=403)
+    closed = await asyncio.to_thread(store.admin_close, payload.link_ref)
+    if closed is None:
+        return _admin_not_found()
+    if closed.source_url is not None:
+        state.cache.invalidate(closed.source_url)
+    return JSONResponse(
+        {"status": "closed"},
         headers={"Cache-Control": _NO_STORE, "Pragma": "no-cache"},
     )
 

@@ -8,6 +8,7 @@ the full fetch->parse->render->cache flow.
 from __future__ import annotations
 
 import base64
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -40,6 +41,7 @@ VMESS_LINK = (
 )
 MIXED = "\n".join([SS_LINK, VMESS_LINK])
 LINK_SECRET_KEY = base64.urlsafe_b64encode(bytes(range(32))).decode()
+ADMIN_BOOTSTRAP_SECRET = base64.urlsafe_b64encode(bytes(range(32, 64))).decode().rstrip("=")
 
 
 @pytest.fixture()
@@ -70,10 +72,13 @@ def persistent_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestCl
         link_secret_key=LINK_SECRET_KEY,
         max_active_links=2,
         max_links_per_source=2,
+        max_links_per_user=2,
+        max_links_per_network=2,
         public_base_url="https://testserver",
+        admin_bootstrap_secret=ADMIN_BOOTSTRAP_SECRET,
     )
     app = create_app(settings, url_validator=default_url_validator(resolve=False))
-    with TestClient(app) as c:
+    with TestClient(app, base_url="https://testserver") as c:
         yield c
 
 
@@ -101,6 +106,9 @@ def test_root_has_strict_privacy_headers(client: TestClient) -> None:
     assert r.headers["referrer-policy"] == "no-referrer"
     assert r.headers["x-frame-options"] == "DENY"
     assert r.headers["x-content-type-options"] == "nosniff"
+    assert "jms_client_device=" in r.headers["set-cookie"]
+    assert "HttpOnly" in r.headers["set-cookie"]
+    assert "SameSite=strict" in r.headers["set-cookie"]
 
 
 def test_docs_are_disabled_by_default(client: TestClient) -> None:
@@ -241,6 +249,135 @@ def test_persistent_link_requires_https(persistent_client: TestClient) -> None:
     assert response.json()["code"] == "https_required"
 
 
+def test_admin_is_one_browser_bound_and_never_exposes_link_secrets(
+    persistent_client: TestClient,
+) -> None:
+    assert persistent_client.get("/admin").status_code == 404
+    enrollment_page = persistent_client.get("/admin/enroll")
+    assert enrollment_page.status_code == 200
+    assert "Enroll this browser" in enrollment_page.text
+    assert ADMIN_BOOTSTRAP_SECRET not in enrollment_page.text
+
+    wrong = persistent_client.post(
+        "/api/admin/enroll",
+        json={"bootstrap_secret": "W" * 43},
+    )
+    assert wrong.status_code == 404
+    enrolled = persistent_client.post(
+        "/api/admin/enroll",
+        json={"bootstrap_secret": ADMIN_BOOTSTRAP_SECRET},
+    )
+    assert enrolled.status_code == 201
+    cookies = "\n".join(enrolled.headers.get_list("set-cookie"))
+    assert "jms_admin_device=" in cookies
+    assert "Secure" in cookies
+    assert "HttpOnly" in cookies
+    assert "SameSite=strict" in cookies
+    assert persistent_client.get("/admin/enroll").status_code == 404
+
+    created = persistent_client.post(
+        "/api/links",
+        json={"url": SUB_URL, "format": "clash"},
+    )
+    assert created.status_code == 201
+    access_token = urlsplit(created.json()["subscription_url"]).path.rsplit("/", 1)[-1]
+    manage_key = created.json()["manage_key"]
+
+    dashboard = persistent_client.get("/admin")
+    assert dashboard.status_code == 200
+    assert SUB_URL not in dashboard.text
+    assert access_token not in dashboard.text
+    assert manage_key not in dashboard.text
+    csrf_match = re.search(r'const csrf = "([A-Za-z0-9_-]{43})"', dashboard.text)
+    assert csrf_match is not None
+
+    overview = persistent_client.get("/api/admin/overview")
+    assert overview.status_code == 200
+    overview_payload = overview.json()
+    assert overview_payload["active"] == 1
+    assert overview_payload["unique_users"] == 1
+    assert SUB_URL not in overview.text
+    assert access_token not in overview.text
+    assert manage_key not in overview.text
+    link_ref = overview_payload["links"][0]["link_ref"]
+
+    without_csrf = persistent_client.post(
+        "/api/admin/links/close",
+        json={"link_ref": link_ref},
+    )
+    assert without_csrf.status_code == 403
+    closed = persistent_client.post(
+        "/api/admin/links/close",
+        headers={"X-Admin-CSRF": csrf_match.group(1)},
+        json={"link_ref": link_ref},
+    )
+    assert closed.status_code == 200
+    assert persistent_client.get(f"/s/{access_token}").status_code == 404
+
+    # Possessing the admin cookie alone, or pairing it with a different device
+    # cookie, cannot authenticate a second browser profile.
+    admin_cookie = persistent_client.cookies.get("jms_admin_device")
+    persistent_client.cookies.clear()
+    persistent_client.cookies.set("jms_admin_device", admin_cookie)
+    assert persistent_client.get("/admin").status_code == 404
+    persistent_client.cookies.set("jms_client_device", "R" * 43)
+    assert persistent_client.get("/admin").status_code == 404
+
+
+def test_http_creation_enforces_device_and_trusted_network_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def stub(self: SubscriptionParser, url: str) -> object:
+        return self.parse_text(MIXED)
+
+    monkeypatch.setattr(SubscriptionParser, "fetch_and_parse", stub)
+    settings = Settings().with_overrides(
+        persistent_links_enabled=True,
+        link_database_path=str(tmp_path / "links.sqlite3"),
+        link_secret_key=LINK_SECRET_KEY,
+        max_active_links=5,
+        max_links_per_source=5,
+        max_links_per_user=1,
+        max_links_per_network=1,
+        public_base_url="https://testserver",
+        trusted_client_ip_header="X-Forwarded-For",
+    )
+    app = create_app(settings, url_validator=default_url_validator(resolve=False))
+    with TestClient(app, base_url="https://testserver") as local_client:
+        first = local_client.post(
+            "/api/links",
+            headers={"X-Forwarded-For": "203.0.113.5"},
+            json={"url": f"{SUB_URL}&slot=1", "format": "clash"},
+        )
+        assert first.status_code == 201
+
+        same_device = local_client.post(
+            "/api/links",
+            headers={"X-Forwarded-For": "203.0.113.6"},
+            json={"url": f"{SUB_URL}&slot=2", "format": "clash"},
+        )
+        assert same_device.status_code == 409
+        assert same_device.json()["code"] == "user_limit_reached"
+
+        local_client.cookies.clear()
+        same_network = local_client.post(
+            "/api/links",
+            headers={"X-Forwarded-For": "203.0.113.5"},
+            json={"url": f"{SUB_URL}&slot=3", "format": "clash"},
+        )
+        assert same_network.status_code == 429
+        assert same_network.json()["code"] == "network_limit_reached"
+
+        local_client.cookies.clear()
+        different_identity = local_client.post(
+            "/api/links",
+            headers={"X-Forwarded-For": "203.0.113.7"},
+            json={"url": f"{SUB_URL}&slot=4", "format": "clash"},
+        )
+        assert different_identity.status_code == 201
+
+
 def test_legacy_url_endpoints_can_be_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -271,6 +408,29 @@ def test_persistent_links_fail_closed_for_unsafe_public_base_url(
         public_base_url=public_base_url,
     )
     with pytest.raises(LinkStoreConfigurationError, match="PUBLIC_BASE_URL"):
+        AppState(settings, url_validator=default_url_validator(resolve=False))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"admin_bootstrap_secret": "too-short"}, "ADMIN_BOOTSTRAP_SECRET"),
+        ({"trusted_client_ip_header": "bad header"}, "TRUSTED_CLIENT_IP_HEADER"),
+    ],
+)
+def test_identity_security_settings_fail_closed(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    settings = Settings().with_overrides(
+        persistent_links_enabled=True,
+        link_database_path=str(tmp_path / "links.sqlite3"),
+        link_secret_key=LINK_SECRET_KEY,
+        public_base_url="https://service.example",
+        **overrides,
+    )
+    with pytest.raises(LinkStoreConfigurationError, match=message):
         AppState(settings, url_validator=default_url_validator(resolve=False))
 
 

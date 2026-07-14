@@ -134,11 +134,52 @@ class Settings:
     )
     max_active_links: int = field(default_factory=lambda: _as_int("MAX_ACTIVE_LINKS", 100))
     max_links_per_source: int = field(default_factory=lambda: _as_int("MAX_LINKS_PER_SOURCE", 3))
+    max_links_per_user: int = field(default_factory=lambda: _as_int("MAX_LINKS_PER_USER", 3))
+    max_links_per_network: int = field(default_factory=lambda: _as_int("MAX_LINKS_PER_NETWORK", 10))
     public_base_url: str = field(
         default_factory=lambda: os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     )
     allow_legacy_url_endpoints: bool = field(
         default_factory=lambda: _as_bool("ALLOW_LEGACY_URL_ENDPOINTS", True)
+    )
+
+    # Pseudonymous client identity and abuse controls. The trusted header is
+    # opt-in because accepting an arbitrary forwarded-IP header lets callers
+    # spoof network identities unless a known reverse proxy overwrites it.
+    trusted_client_ip_header: str = field(
+        default_factory=lambda: os.environ.get("TRUSTED_CLIENT_IP_HEADER", "").strip()
+    )
+    client_cookie_max_age_seconds: int = field(
+        default_factory=lambda: _as_int("CLIENT_COOKIE_MAX_AGE_SECONDS", 31_536_000)
+    )
+    check_rate_limit: int = field(default_factory=lambda: _as_int("CHECK_RATE_LIMIT", 30))
+    check_rate_window_seconds: int = field(
+        default_factory=lambda: _as_int("CHECK_RATE_WINDOW_SECONDS", 60)
+    )
+    create_rate_limit: int = field(default_factory=lambda: _as_int("CREATE_RATE_LIMIT", 5))
+    create_rate_window_seconds: int = field(
+        default_factory=lambda: _as_int("CREATE_RATE_WINDOW_SECONDS", 3600)
+    )
+    close_rate_limit: int = field(default_factory=lambda: _as_int("CLOSE_RATE_LIMIT", 20))
+    close_rate_window_seconds: int = field(
+        default_factory=lambda: _as_int("CLOSE_RATE_WINDOW_SECONDS", 60)
+    )
+
+    # One-time admin enrollment. The secret is sent once in a POST body and is
+    # excluded from settings repr output. The database stores only HMACs of the
+    # resulting browser credentials.
+    admin_bootstrap_secret: str = field(
+        default_factory=lambda: os.environ.get("ADMIN_BOOTSTRAP_SECRET", ""),
+        repr=False,
+    )
+    admin_cookie_max_age_seconds: int = field(
+        default_factory=lambda: _as_int("ADMIN_COOKIE_MAX_AGE_SECONDS", 31_536_000)
+    )
+    admin_enroll_rate_limit: int = field(
+        default_factory=lambda: _as_int("ADMIN_ENROLL_RATE_LIMIT", 5)
+    )
+    admin_enroll_rate_window_seconds: int = field(
+        default_factory=lambda: _as_int("ADMIN_ENROLL_RATE_WINDOW_SECONDS", 3600)
     )
 
     def with_overrides(self, **kwargs: object) -> Settings:

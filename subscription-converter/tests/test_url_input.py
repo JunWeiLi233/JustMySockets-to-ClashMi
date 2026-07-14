@@ -60,6 +60,10 @@ def test_does_not_decode_non_url_encoded_text() -> None:
     assert normalize_subscription_url("https://example.com/a%2") == "https://example.com/a%2"
 
 
+def test_strips_browser_only_fragment() -> None:
+    assert normalize_subscription_url(f"{CLEAN}#quota-bypass") == CLEAN
+
+
 def test_rejects_empty() -> None:
     with pytest.raises(InvalidSubscriptionURL):
         normalize_subscription_url("")

@@ -132,6 +132,33 @@ def test_masking_filter_redacts_bare_urls() -> None:
     assert "sub.example.com" not in rendered
 
 
+def test_masking_filter_redacts_percent_encoded_url_parameter() -> None:
+    from subscription_converter.app import _MaskingFilter
+
+    text = "GET /clash?url=https%3A%2F%2Fexample.com%2Fsub%3Fid%3Dprivate HTTP/1.1"
+    redacted = _MaskingFilter()._redact(text)
+    assert "private" not in redacted
+    assert "url=<redacted>" in redacted
+
+
+def test_proxy_node_repr_excludes_credentials() -> None:
+    from subscription_converter.models import ProxyNode, ProxyType
+
+    node = ProxyNode(
+        type=ProxyType.VLESS,
+        name="node",
+        server="proxy.example.com",
+        port=443,
+        password="password-private",
+        uuid="uuid-private",
+        obfs_password="obfs-private",
+    )
+    rendered = repr(node)
+    assert "password-private" not in rendered
+    assert "uuid-private" not in rendered
+    assert "obfs-private" not in rendered
+
+
 def test_masking_filter_redacts_secret_keys() -> None:
     from subscription_converter.app import _MaskingFilter
 

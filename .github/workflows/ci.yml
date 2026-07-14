@@ -66,6 +66,10 @@ jobs:
         # Integration tests (e.g. real mihomo binary) are opt-in via marker.
         run: pytest -m "not integration"
 
+      - name: Audit Python dependencies
+        if: matrix.python-version == '3.12'
+        run: pip-audit
+
   pre-commit:
     name: pre-commit hooks
     runs-on: ubuntu-latest

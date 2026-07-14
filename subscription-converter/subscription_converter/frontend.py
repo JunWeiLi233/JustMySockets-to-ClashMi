@@ -1,8 +1,9 @@
 """Self-contained, privacy-preserving frontend for the converter.
 
-The page intentionally has no external assets, analytics, cookies, or browser
-storage. Sensitive values are sent only to same-origin JSON endpoints when the
-user explicitly tests, creates, or closes a durable subscription link.
+The page intentionally has no external assets or analytics. A random HttpOnly
+device cookie supports fair-use quotas. Sensitive values are sent only to
+same-origin JSON endpoints when the user explicitly tests, creates, or closes
+a durable subscription link.
 """
 
 from __future__ import annotations
@@ -470,7 +471,7 @@ _PAGE = r"""<!doctype html>
           </div>
           <div class="privacy-list">
             <div class="privacy-item"><span class="check">✓</span><div><strong>No analytics or third-party assets</strong><span>No trackers, fonts, CDNs, or external JavaScript.</span></div></div>
-            <div class="privacy-item"><span class="check">✓</span><div><strong>No browser storage</strong><span>Your link is never written to cookies, localStorage, or sessionStorage.</span></div></div>
+            <div class="privacy-item"><span class="check">✓</span><div><strong>No subscription storage</strong><span>Your link is never written to cookies, localStorage, or sessionStorage. A random HttpOnly device cookie is used only for fair-use limits.</span></div></div>
             <div class="privacy-item"><span class="check">✓</span><div><strong>Encrypted durable registry</strong><span>Original URLs use authenticated encryption; lookup and management tokens are stored only as HMAC digests.</span></div></div>
             <div class="privacy-item"><span class="check">✓</span><div><strong>No shared config caching</strong><span>Rendered proxy credentials are private, non-cacheable, and held in memory only briefly.</span></div></div>
           </div>

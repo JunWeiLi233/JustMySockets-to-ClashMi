@@ -34,13 +34,17 @@ The fastest durable setup uses Docker plus the named volume already declared in
 git clone https://github.com/JunWeiLi233/JustMySockets-to-ClashMi.git
 cd JustMySockets-to-ClashMi
 
-# 2. Generate a key once, then save it in a private .env file
+# 2. Generate the encryption key once, then save it in a private .env file
 python3 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'
+
+# Generate a separate one-time admin enrollment secret
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 
 # .env (replace the placeholder; never commit this file or regenerate the key)
 PERSISTENT_LINKS_ENABLED=true
 LINK_SECRET_KEY=PASTE_THE_GENERATED_KEY
 PUBLIC_BASE_URL=http://localhost:8000
+ADMIN_BOOTSTRAP_SECRET=PASTE_THE_ONE_TIME_ADMIN_SECRET
 
 # 3. Build & run
 docker compose up -d --build
@@ -57,6 +61,12 @@ The stable URL has the form `https://your-service.example/s/<random-token>` and
 does not expose the original JMS credential. It has no automatic expiry and
 keeps refreshing while this service, its durable storage, and the upstream
 provider remain active.
+
+To enroll the admin, open `http://localhost:8000/admin/enroll` in the Safari
+profile you want to trust and submit the one-time admin secret. The first
+successful browser is the only enrolled admin. Remove
+`ADMIN_BOOTSTRAP_SECRET` from the environment and restart after enrollment;
+normal admin access does not need it.
 
 ---
 
@@ -91,7 +101,8 @@ pip install -r requirements.txt
 > **What does `requirements.txt` contain?** It pins the runtime dependencies:
 > `fastapi` (the web framework), `uvicorn` (the ASGI server), `httpx` (HTTP
 > client used to download the upstream subscription), `pydantic` (data
-> validation for proxy nodes), and `PyYAML` (to emit the Clash YAML). After
+> validation for proxy nodes), `PyYAML` (to emit the Clash YAML), and
+> `cryptography` (AES-GCM durable storage). After
 > this step you have everything needed to run the service.
 
 ```bash
@@ -110,8 +121,9 @@ If you plan to develop or run the test suite, also install the dev tools:
 pip install -r requirements-dev.txt
 ```
 
-This adds `pytest` + `pytest-asyncio` (testing), `respx` (HTTP mocking),
-`ruff` (linter/formatter), `mypy` (type checker), and `pre-commit` (git hooks).
+This adds `pytest` + `pytest-asyncio` + `httpx2` (testing), `respx` (HTTP mocking),
+`ruff` (linter/formatter), `mypy` (type checker), `pip-audit` (dependency security),
+and `pre-commit` (git hooks).
 
 ---
 
@@ -119,18 +131,33 @@ This adds `pytest` + `pytest-asyncio` (testing), `respx` (HTTP mocking),
 
 Understanding the pipeline helps you debug and extend the service.
 
+```mermaid
+flowchart TB
+    User["User browser"] -->|"Secure HttpOnly random device cookie"| Identity["Pseudonymous identity layer"]
+    Edge["Trusted Render / reverse-proxy edge"] -->|"client IP header"| Identity
+    Identity -->|"HMAC device + network digests only"| Limits["Atomic creation limits<br/>global 100 · per source 3 · per device 3 · per network 10"]
+    Limits -->|"slot available"| API["FastAPI same-origin API"]
+    API -->|"verify over HTTPS"| Pipeline["Fetch → decode → parse → convert"]
+    Pipeline --> Upstream["Upstream JMS subscription"]
+    API --> Registry["Encrypted durable registry"]
+    Registry --> Disk[("SQLite persistent disk<br/>AES-GCM source URLs<br/>HMAC token/identity digests")]
+    Key["LINK_SECRET_KEY<br/>never stored on disk"] --> Registry
+    API -->|"return once"| Secrets["/s/access-token + management key"]
+    Clash["Clash / Mihomo"] -->|"GET /s/access-token"| API
+    Registry -->|"decrypt URL in memory"| Cache["HMAC-keyed TTL memory cache"]
+    Cache --> Pipeline
+    Pipeline -->|"current config"| Clash
+
+    Safari["This Safari profile"] -->|"one-time POST /api/admin/enroll"| Enroll["First-device enrollment gate"]
+    Bootstrap["ADMIN_BOOTSTRAP_SECRET<br/>remove after enrollment"] --> Enroll
+    Enroll -->|"two bound Secure HttpOnly cookies"| Admin["/admin dashboard"]
+    Other["Every other browser"] -.->|"404"| Admin
+    Admin -->|"metadata only + CSRF-protected close"| Registry
 ```
-┌──────────────┐   opaque token   ┌──────────────────┐   decrypted in memory
-│ Clash client │─────────────────▶│ Encrypted link   │─────────────────────┐
-│              │◀─────────────────│ registry (SQLite)│                     │
-└──────────────┘   current config └──────────────────┘                     ▼
-                                                                  ┌──────────────┐
-                                           5-minute memory cache ◀─│ Parser +     │
-                                           ──────────────────────▶│ converter    │
-                                                                  └──────┬───────┘
-                                                                         ▼
-                                                                  Upstream JMS URL
-```
+
+The access token and management key take separate paths: an access token can
+only retrieve the rendered configuration, while the management key can only
+delete its registry record. Neither token reveals the encrypted upstream URL.
 
 ### 3.1 Durable link registry
 
@@ -138,11 +165,36 @@ Understanding the pipeline helps you debug and extend the service.
 - Only HMAC-SHA256 token digests are stored; plaintext bearer tokens are not.
 - Original upstream URLs are encrypted with AES-256-GCM before SQLite writes.
 - Create uses an atomic transaction, so concurrent requests cannot exceed
-  `MAX_ACTIVE_LINKS`.
+  global, per-source, per-device, or per-network limits.
+- A 256-bit random Secure/HttpOnly cookie is the primary user identifier. Only
+  its keyed HMAC is persisted. IP addresses are secondary abuse signals; only
+  keyed HMACs are stored, never raw addresses.
 - Closing with the management key hard-deletes the record and immediately frees
   one slot. There is no background expiry job.
 
-### 3.2 Parser (input side)
+### 3.2 Admin browser
+
+- `/admin/enroll` accepts the bootstrap secret once in a POST body. The first
+  successful browser profile becomes the only admin; every other browser gets
+  a 404 from the admin page and APIs.
+- Admin authentication requires both a random admin cookie and the device
+  cookie it was enrolled with. Both are `Secure`, `HttpOnly`, and
+  `SameSite=Strict`; destructive requests additionally require a derived CSRF
+  token.
+- The dashboard receives only counts, timestamps, formats, and short
+  pseudonymous references. It never receives upstream URLs, proxy credentials,
+  access tokens, or management keys.
+- This is browser-profile binding, not immutable hardware attestation. A stolen
+  pair of cookies remains a bearer credential. For stronger hardware-backed
+  identity, add WebAuthn or mutual TLS.
+
+If Safari site data is deleted, admin access intentionally fails closed. To
+recover, stop the service, back up the database, delete the single
+`admin_device` row from SQLite using server-side access, set a newly generated
+bootstrap secret, restart, and enroll Safari again. Never add a public “reset
+admin” endpoint.
+
+### 3.3 Parser (input side)
 
 The parser is **provider-independent** — it doesn't care who published the
 subscription. It:
@@ -161,7 +213,7 @@ subscription. It:
    - `tuic://` — TUIC v5
 4. **Returns** a `Subscription` (the list of nodes + safe upstream metadata).
 
-### 3.3 Converter (output side)
+### 3.4 Converter (output side)
 
 The converter turns the list of `ProxyNode`s into the target format. The
 **Mihomo converter** generates:
@@ -178,7 +230,7 @@ The converter turns the list of `ProxyNode`s into the target format. The
 > Surge and sing-box converters are also wired up (`/surge`, `/sing-box`) and
 > share the same parser — they're intentionally minimal placeholders for now.
 
-### 3.4 Dynamic updates ("always fresh")
+### 3.5 Dynamic updates ("always fresh")
 
 This is the key production behavior:
 
@@ -205,6 +257,10 @@ This is the key production behavior:
 | POST   | `/api/check`         | Test without storing                                 | `application/json` |
 | POST   | `/api/links`         | Verify and create an encrypted permanent link        | `application/json` |
 | POST   | `/api/links/close`   | Permanently close using a management key in the body | `application/json` |
+| GET    | `/admin/enroll`      | One-time first-browser admin enrollment              | `text/html` |
+| GET    | `/admin`             | Enrolled-browser metadata dashboard                  | `text/html` |
+| GET    | `/api/admin/overview`| Pseudonymous admin metrics and link references       | `application/json` |
+| POST   | `/api/admin/links/close` | CSRF-protected admin close by non-bearer reference | `application/json` |
 | GET    | `/s/{access_token}`  | Current config for one durable link                  | format-specific |
 | GET    | `/clash`, `/surge`, `/sing-box` | Legacy raw-URL endpoints (optional)         | format-specific |
 | GET    | `/docs`              | Swagger UI when `ENABLE_DOCS=true`                   | `text/html` |
@@ -265,6 +321,13 @@ All settings are **environment variables**. You can set them before running
 | `PUBLIC_BASE_URL`         | *(required when enabled)*            | Canonical HTTPS origin used in generated links. Local HTTP is accepted only for localhost. |
 | `MAX_ACTIVE_LINKS`        | `100`                                | Atomic global creation cap. Existing links continue working when full. |
 | `MAX_LINKS_PER_SOURCE`    | `3`                                  | Maximum links for the same upstream URL and output format.             |
+| `MAX_LINKS_PER_USER`      | `3`                                  | Maximum active links owned by one pseudonymous browser device.         |
+| `MAX_LINKS_PER_NETWORK`   | `10`                                 | Secondary active-link ceiling for one HMAC-pseudonymised client IP.    |
+| `TRUSTED_CLIENT_IP_HEADER`| *(empty)*                            | Client-IP header supplied by a trusted edge. Never enable for a caller-controlled header. |
+| `ADMIN_BOOTSTRAP_SECRET`  | *(empty)*                            | One-time 43-character enrollment token. Remove it after the first admin browser enrolls. |
+| `CHECK_RATE_LIMIT` / `CHECK_RATE_WINDOW_SECONDS` | `30` / `60` | Per-device and per-network connection-check limit/window. |
+| `CREATE_RATE_LIMIT` / `CREATE_RATE_WINDOW_SECONDS` | `5` / `3600` | Per-device and per-network creation-attempt limit/window. |
+| `CLOSE_RATE_LIMIT` / `CLOSE_RATE_WINDOW_SECONDS` | `20` / `60` | Per-device and per-network close-attempt limit/window. |
 | `ALLOW_LEGACY_URL_ENDPOINTS` | `true`                           | Keep or disable raw `?url=` endpoints after migration.                 |
 
 **Example — set a config via environment variables (no Docker):**
@@ -284,9 +347,9 @@ credentials). Key safeguards:
 
 - **Subscription URLs and passwords are NEVER logged.** A process-wide logging
   filter redacts any `url=...` value before it reaches any log handler.
-- **The browser UI has no analytics, third-party assets, cookies, or browser
-  storage.** Sensitive values are sent only after an explicit test, create, or
-  close action.
+- **The browser UI has no analytics or third-party assets.** It stores no
+  subscription URL in browser storage. One random HttpOnly device cookie is
+  used for fair-use quotas, and only its HMAC digest is persisted.
 - **Durable source URLs use AES-256-GCM authenticated encryption.** The database
   stores only ciphertext plus HMAC digests of access/management tokens. The
   management key is returned once and never placed in request URLs.
@@ -297,6 +360,9 @@ credentials). Key safeguards:
   is durable.
 - **Strict browser headers** enforce a nonce-based CSP, no referrers, no framing,
   no MIME sniffing, and no access to camera/location/microphone APIs.
+- **Admin is deny-by-default and one-browser enrolled.** Unauthenticated admin
+  routes return 404; the UI exposes only pseudonymous metadata; mutations are
+  same-origin and CSRF protected.
 - **The Docker container runs as a non-root user** (uid 1001).
 - **`ALLOWED_HOSTS`** restricts which upstream providers may be contacted
   (defence-in-depth against SSRF via the `?url=` parameter).
@@ -333,11 +399,17 @@ permanent-link feature:
 
 1. Use a paid web service and attach the smallest persistent disk at `/var/data`.
 2. Set `PERSISTENT_LINKS_ENABLED=true`, `LINK_DATABASE_PATH=/var/data/subscriptions.sqlite3`,
-   a generated `LINK_SECRET_KEY`, the canonical `PUBLIC_BASE_URL`, and a conservative
-   `MAX_ACTIVE_LINKS`.
+   a generated `LINK_SECRET_KEY`, the canonical `PUBLIC_BASE_URL`, conservative
+   link limits, and `TRUSTED_CLIENT_IP_HEADER=X-Forwarded-For`.
 3. Keep one service instance (`WORKERS=1` is recommended on the Starter plan).
 4. Back up the encryption key separately. Render disk snapshots cannot decrypt
    records without it.
+5. Temporarily set a separately generated `ADMIN_BOOTSTRAP_SECRET`, deploy, then
+   open `/admin/enroll` in the Safari profile on this computer. Remove that
+   environment variable and redeploy immediately after successful enrollment.
+6. Set `ALLOW_LEGACY_URL_ENDPOINTS=false` after any raw-URL subscribers have
+   migrated to opaque `/s/` links, so upstream credentials never appear in
+   request URLs or edge logs.
 
 Render currently lists Starter compute at $7/month and persistent SSD storage at
 $0.25/GB/month, so a 1 GB disk is approximately $7.25/month before bandwidth.
@@ -390,9 +462,12 @@ subscription-converter/
 │   ├── converters/                 # output renderers (mihomo, surge, sing-box)
 │   ├── converter_registry.py       # output format registry
 │   ├── cache.py                    # HMAC-keyed TTL cache
+│   ├── rate_limit.py               # ephemeral pseudonymous request limiter
+│   ├── link_store.py               # encrypted durable-link registry
+│   ├── admin_frontend.py           # enrolled-browser admin UI
 │   ├── config.py                   # immutable Settings (env-driven)
 │   └── app.py                      # FastAPI app + endpoints
-└── tests/                          # pytest suite (90 tests)
+└── tests/                          # pytest suite (174 tests)
 ```
 
 ---
@@ -426,13 +501,17 @@ OpenClash 等)直接订阅。
 git clone https://github.com/JunWeiLi233/JustMySockets-to-ClashMi.git
 cd JustMySockets-to-ClashMi
 
-# 2. 只生成一次密钥,并保存到私有 .env 文件
+# 2. 只生成一次加密密钥,并保存到私有 .env 文件
 python3 -c 'import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'
+
+# 另行生成一次性管理员注册密钥
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 
 # .env(替换占位符;不要提交该文件,有记录后不要重新生成密钥)
 PERSISTENT_LINKS_ENABLED=true
 LINK_SECRET_KEY=粘贴刚才生成的密钥
 PUBLIC_BASE_URL=http://localhost:8000
+ADMIN_BOOTSTRAP_SECRET=粘贴一次性管理员密钥
 
 # 3. 构建并运行
 docker compose up -d --build
@@ -446,6 +525,11 @@ docker compose up -d --build
 
 稳定地址形如 `https://你的服务/s/<随机令牌>`,不会暴露原始 JMS 凭据。它不
 自动过期;只要本服务、持久磁盘和上游供应商都保持可用,客户端就会持续刷新。
+
+管理员注册:请在要授权的 Safari 浏览器配置中打开
+`http://localhost:8000/admin/enroll`,提交一次性管理员密钥。第一个成功注册的
+浏览器是唯一管理员。注册完成后从环境变量中删除 `ADMIN_BOOTSTRAP_SECRET` 并
+重启;日常管理不再需要这个一次性密钥。
 
 ---
 
@@ -479,7 +563,8 @@ pip install -r requirements.txt
 
 > **`requirements.txt` 里有什么?** 它固定了运行时依赖:`fastapi`(Web 框架)、
 > `uvicorn`(ASGI 服务器)、`httpx`(用于下载上游订阅的 HTTP 客户端)、
-> `pydantic`(代理节点的数据校验)、`PyYAML`(生成 Clash YAML)。执行完这一步,
+> `pydantic`(代理节点的数据校验)、`PyYAML`(生成 Clash YAML)和
+> `cryptography`(AES-GCM 持久存储)。执行完这一步,
 > 你就拥有运行本服务所需的全部依赖。
 
 ```bash
@@ -498,8 +583,9 @@ uvicorn subscription_converter.app:app --host 0.0.0.0 --port 8000
 pip install -r requirements-dev.txt
 ```
 
-这会额外安装 `pytest` + `pytest-asyncio`(测试)、`respx`(HTTP 模拟)、
-`ruff`(代码检查/格式化)、`mypy`(类型检查)、`pre-commit`(Git 钩子)。
+这会额外安装 `pytest` + `pytest-asyncio` + `httpx2`(测试)、`respx`(HTTP 模拟)、
+`ruff`(代码检查/格式化)、`mypy`(类型检查)、`pip-audit`(依赖安全审计)和
+`pre-commit`(Git 钩子)。
 
 ---
 
@@ -507,28 +593,59 @@ pip install -r requirements-dev.txt
 
 理解这条流水线有助于排查问题和扩展功能。
 
+```mermaid
+flowchart TB
+    User["用户浏览器"] -->|"Secure HttpOnly 随机设备 Cookie"| Identity["匿名化身份层"]
+    Edge["可信 Render / 反向代理边缘"] -->|"客户端 IP 请求头"| Identity
+    Identity -->|"只传 HMAC 设备/网络摘要"| Limits["原子创建限制<br/>全局 100 · 每来源 3 · 每设备 3 · 每网络 10"]
+    Limits -->|"还有名额"| API["FastAPI 同源 API"]
+    API -->|"HTTPS 验证"| Pipeline["下载 → 解码 → 解析 → 转换"]
+    Pipeline --> Upstream["上游 JMS 订阅"]
+    API --> Registry["加密持久注册表"]
+    Registry --> Disk[("SQLite 持久磁盘<br/>AES-GCM 来源 URL<br/>HMAC 令牌/身份摘要")]
+    Key["LINK_SECRET_KEY<br/>不写入磁盘"] --> Registry
+    API -->|"仅返回一次"| Secrets["/s/访问令牌 + 管理密钥"]
+    Clash["Clash / Mihomo"] -->|"GET /s/访问令牌"| API
+    Registry -->|"仅在内存解密 URL"| Cache["HMAC 键控 TTL 内存缓存"]
+    Cache --> Pipeline
+    Pipeline -->|"当前配置"| Clash
+
+    Safari["本机 Safari 配置"] -->|"一次性 POST /api/admin/enroll"| Enroll["首设备注册闸门"]
+    Bootstrap["ADMIN_BOOTSTRAP_SECRET<br/>注册后删除"] --> Enroll
+    Enroll -->|"两个绑定的 Secure HttpOnly Cookie"| Admin["/admin 管理面板"]
+    Other["其他所有浏览器"] -.->|"404"| Admin
+    Admin -->|"只读元数据 + CSRF 防护关闭"| Registry
 ```
-┌──────────────┐   不透明令牌   ┌──────────────────┐   仅在内存解密
-│ Clash 客户端 │───────────────▶│ 加密链接注册表     │─────────────────────┐
-│              │◀───────────────│ (SQLite)         │                     │
-└──────────────┘   当前配置      └──────────────────┘                     ▼
-                                                                ┌──────────────┐
-                                         5 分钟内存缓存 ◀────────│ 解析器 +      │
-                                         ──────────────────────▶│ 转换器        │
-                                                                └──────┬───────┘
-                                                                       ▼
-                                                                上游 JMS 地址
-```
+
+访问令牌和管理密钥走两条相互独立的路径：访问令牌只能读取生成后的配置，管理
+密钥只能删除对应的注册记录；两者都不会暴露加密保存的上游 URL。
 
 ### 3.1 持久链接注册表
 
 - 访问令牌和管理密钥是两个独立的 256 位随机值。
 - 磁盘只保存令牌的 HMAC-SHA256 摘要,不保存明文令牌。
 - 原始上游 URL 在写入 SQLite 前使用 AES-256-GCM 认证加密。
-- 创建使用原子事务,并发请求无法突破 `MAX_ACTIVE_LINKS`。
+- 创建使用原子事务,并发请求无法突破全局、每来源、每设备和每网络上限。
+- 主要用户标识是 256 位随机的 Secure/HttpOnly Cookie;持久化的只有键控 HMAC。
+  IP 地址只是次要滥用信号,也只保存 HMAC,绝不保存原始地址。
 - 使用管理密钥关闭后会硬删除记录并立即释放名额;没有后台自动过期。
 
-### 3.2 解析器(输入侧)
+### 3.2 管理员浏览器
+
+- `/admin/enroll` 只在第一次接受请求体中的一次性密钥。第一个成功注册的浏览器
+  配置是唯一管理员;其余浏览器访问管理页面和 API 都得到 404。
+- 管理认证同时要求管理员 Cookie 和当初绑定的设备 Cookie。两者都是 `Secure`、
+  `HttpOnly`、`SameSite=Strict`;破坏性请求还要求派生的 CSRF 令牌。
+- 面板只接收数量、时间、格式和短匿名引用;永远不接收上游 URL、代理凭据、访问
+  令牌或管理密钥。
+- 这是浏览器配置绑定,不是不可复制的硬件认证。如果两个 Cookie 同时被盗,仍可
+  作为 bearer 凭据使用。需要硬件级保证时应增加 WebAuthn 或双向 TLS。
+
+如果删除了 Safari 网站数据,管理员访问会按设计拒绝。恢复时应停止服务、备份
+数据库、通过服务器端访问删除 SQLite 中唯一的 `admin_device` 记录,设置新生成的
+一次性密钥,重启并重新注册 Safari。不要增加公开的“重置管理员”接口。
+
+### 3.3 解析器(输入侧)
 
 解析器**与供应商无关** —— 它不关心是谁发布的订阅。它会:
 
@@ -546,7 +663,7 @@ pip install -r requirements-dev.txt
    - `tuic://` —— TUIC v5
 4. **返回**一个 `Subscription`(节点列表 + 安全的上游元数据)。
 
-### 3.3 转换器(输出侧)
+### 3.4 转换器(输出侧)
 
 转换器把 `ProxyNode` 列表转换成目标格式。**Mihomo 转换器**会生成:
 
@@ -585,6 +702,10 @@ pip install -r requirements-dev.txt
 | POST | `/api/check`         | 测试但不保存                              | `application/json` |
 | POST | `/api/links`         | 验证并创建加密的永久链接                    | `application/json` |
 | POST | `/api/links/close`   | 用请求体中的管理密钥永久关闭                | `application/json` |
+| GET  | `/admin/enroll`      | 仅一次的首个浏览器管理员注册                | `text/html` |
+| GET  | `/admin`             | 已注册浏览器的匿名化管理面板                | `text/html` |
+| GET  | `/api/admin/overview`| 匿名化指标和链接引用                        | `application/json` |
+| POST | `/api/admin/links/close` | 用非 bearer 引用执行 CSRF 防护的关闭操作 | `application/json` |
 | GET  | `/s/{access_token}`  | 一个持久链接的当前配置                      | 取决于格式 |
 | GET  | `/clash`、`/surge`、`/sing-box` | 可选的旧式原始 URL 接口          | 取决于格式 |
 | GET  | `/docs`              | `ENABLE_DOCS=true` 时的 Swagger UI         | `text/html` |
@@ -644,6 +765,13 @@ curl http://localhost:8000/health
 | `PUBLIC_BASE_URL`         | *(启用时必填)*                       | 生成链接使用的 HTTPS 规范域名;只有 localhost 可用 HTTP。 |
 | `MAX_ACTIVE_LINKS`        | `100`                                | 原子全局创建上限;满额后已有链接继续工作。                |
 | `MAX_LINKS_PER_SOURCE`    | `3`                                  | 同一上游 URL + 输出格式最多创建多少个链接。              |
+| `MAX_LINKS_PER_USER`      | `3`                                  | 一个匿名化浏览器设备最多拥有的活跃链接数。               |
+| `MAX_LINKS_PER_NETWORK`   | `10`                                 | 一个经过 HMAC 匿名化的客户端 IP 的次级活跃链接上限。     |
+| `TRUSTED_CLIENT_IP_HEADER`| *(空)*                               | 可信边缘提供的客户端 IP 请求头;不得信任调用者可控制的头。 |
+| `ADMIN_BOOTSTRAP_SECRET`  | *(空)*                               | 43 字符一次性注册令牌;首个管理员注册后立即删除。          |
+| `CHECK_RATE_LIMIT` / `CHECK_RATE_WINDOW_SECONDS` | `30` / `60` | 每设备和每网络的测试次数/时间窗口。            |
+| `CREATE_RATE_LIMIT` / `CREATE_RATE_WINDOW_SECONDS` | `5` / `3600` | 每设备和每网络的创建尝试次数/时间窗口。       |
+| `CLOSE_RATE_LIMIT` / `CLOSE_RATE_WINDOW_SECONDS` | `20` / `60` | 每设备和每网络的关闭尝试次数/时间窗口。         |
 | `ALLOW_LEGACY_URL_ENDPOINTS` | `true`                           | 迁移后是否关闭旧式 `?url=` 接口。                       |
 
 **示例 —— 用环境变量配置(无 Docker):**
@@ -662,8 +790,8 @@ uvicorn subscription_converter.app:app --host 0.0.0.0 --port 9000
 
 - **订阅地址和密码绝不写入日志。** 进程级的日志过滤器会在任何日志处理器收到
   记录前,抹除所有 `url=...` 的值。
-- **网页界面不包含分析、第三方资源、Cookie 或浏览器存储。** 敏感值只在用户明
-  确点击测试、创建或关闭时发送。
+- **网页界面不包含分析或第三方资源。** 浏览器存储中不保存订阅 URL。仅使用一个
+  随机 HttpOnly 设备 Cookie 实现公平限制,持久化的只有其 HMAC 摘要。
 - **持久源 URL 使用 AES-256-GCM 认证加密。** 数据库只保存密文及访问/管理令牌
   的 HMAC 摘要。管理密钥仅返回一次,永远不放进请求 URL。
 - **生成配置使用 `private, no-store`。** 共享缓存、CDN 和浏览器缓存不得保留
@@ -672,6 +800,8 @@ uvicorn subscription_converter.app:app --host 0.0.0.0 --port 9000
   到 TTL 到期;持久化的只有加密后的上游 URL。
 - **严格浏览器安全响应头**包含 nonce CSP、禁止 referrer、禁止 iframe、禁止
   MIME 猜测及禁用相机/定位/麦克风等权限。
+- **管理员默认拒绝且只注册一个浏览器。** 未认证管理路由返回 404;页面只暴露
+  匿名化元数据;修改操作要求同源和 CSRF 防护。
 - **Docker 容器以非 root 用户运行**(uid 1001)。
 - **`ALLOWED_HOSTS`** 限制可访问哪些上游供应商(防 SSRF 的纵深防御)。
 
@@ -705,9 +835,14 @@ Render 默认文件系统是临时的。永久链接功能需要:
 
 1. 使用付费 Web Service,并把最小的持久磁盘挂载到 `/var/data`。
 2. 设置 `PERSISTENT_LINKS_ENABLED=true`、`LINK_DATABASE_PATH=/var/data/subscriptions.sqlite3`、
-   一次性生成的 `LINK_SECRET_KEY`、规范 `PUBLIC_BASE_URL` 和保守的 `MAX_ACTIVE_LINKS`。
+   一次性生成的 `LINK_SECRET_KEY`、规范 `PUBLIC_BASE_URL`、保守的链接上限和
+   `TRUSTED_CLIENT_IP_HEADER=X-Forwarded-For`。
 3. 保持一个服务实例(Starter 套餐建议 `WORKERS=1`)。
 4. 单独备份加密密钥;只有磁盘快照、没有密钥也无法解密记录。
+5. 临时设置另行生成的 `ADMIN_BOOTSTRAP_SECRET` 并部署,然后在本机 Safari 配置
+   中打开 `/admin/enroll`。成功后立即删除该环境变量并重新部署。
+6. 所有旧式原始 URL 订阅迁移到不透明 `/s/` 链接后,设置
+   `ALLOW_LEGACY_URL_ENDPOINTS=false`,避免上游凭据进入请求 URL 或边缘日志。
 
 Render 目前 Starter 计算为每月 7 美元,持久 SSD 为每 GB 每月 0.25 美元,因此
 1 GB 磁盘约为每月 7.25 美元(不含额外带宽)。请查看官方
@@ -759,9 +894,12 @@ subscription-converter/
 │   ├── converters/                 # 输出渲染器(mihomo、surge、sing-box)
 │   ├── converter_registry.py       # 输出格式注册表
 │   ├── cache.py                    # HMAC 键控的 TTL 缓存
+│   ├── rate_limit.py               # 临时匿名化请求限流器
+│   ├── link_store.py               # 加密持久链接注册表
+│   ├── admin_frontend.py           # 已注册浏览器的管理界面
 │   ├── config.py                   # 不可变 Settings(环境变量驱动)
 │   └── app.py                      # FastAPI 应用 + 接口
-└── tests/                          # pytest 测试套件(90 个测试)
+└── tests/                          # pytest 测试套件(174 个测试)
 ```
 
 ---

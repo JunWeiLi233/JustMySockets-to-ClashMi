@@ -16,6 +16,8 @@ from subscription_converter.link_store import (
     LinkStore,
     LinkStoreConfigurationError,
     LinkStoreCorruptionError,
+    NetworkLimitReached,
+    UserLimitReached,
 )
 
 __all__ = ()
@@ -30,12 +32,16 @@ def _store(
     *,
     limit: int = 10,
     per_source: int = 3,
+    per_user: int | None = None,
+    per_network: int | None = None,
 ) -> LinkStore:
     return LinkStore(
         path,
         TEST_KEY,
         max_active_links=limit,
         max_links_per_source=per_source,
+        max_links_per_user=per_user,
+        max_links_per_network=per_network,
         clock=lambda: 1_700_000_000,
     )
 
@@ -151,3 +157,99 @@ def test_tampered_ciphertext_is_detected(tmp_path: Path) -> None:
 
     with pytest.raises(LinkStoreCorruptionError, match="authentication"):
         store.get(created.access_token)
+
+
+def test_pseudonymous_user_and_network_quotas_are_independent(tmp_path: Path) -> None:
+    store = _store(
+        tmp_path / "links.sqlite3",
+        per_source=10,
+        per_user=1,
+        per_network=2,
+    )
+    owner_a = "A" * 43
+    owner_b = "B" * 43
+    store.create(
+        f"{SOURCE}&slot=1",
+        "clash",
+        owner_token=owner_a,
+        network_identity="203.0.113.10",
+    )
+    with pytest.raises(UserLimitReached):
+        store.create(
+            f"{SOURCE}&slot=2",
+            "clash",
+            owner_token=owner_a,
+            network_identity="203.0.113.11",
+        )
+    store.create(
+        f"{SOURCE}&slot=3",
+        "clash",
+        owner_token=owner_b,
+        network_identity="203.0.113.10",
+    )
+    with pytest.raises(NetworkLimitReached):
+        store.create(
+            f"{SOURCE}&slot=4",
+            "clash",
+            owner_token="C" * 43,
+            network_identity="203.0.113.10",
+        )
+
+
+def test_identity_material_is_never_persisted_in_plaintext(tmp_path: Path) -> None:
+    database = tmp_path / "links.sqlite3"
+    owner = "Z" * 43
+    network = "198.51.100.77"
+    store = _store(database)
+    store.create(SOURCE, "clash", owner_token=owner, network_identity=network)
+
+    persisted = b"".join(path.read_bytes() for path in tmp_path.iterdir() if path.is_file())
+    assert owner.encode() not in persisted
+    assert network.encode() not in persisted
+
+
+def test_admin_enrollment_is_single_device_bound_and_secret_minimising(tmp_path: Path) -> None:
+    store = _store(tmp_path / "links.sqlite3")
+    owner = "O" * 43
+    device = "D" * 43
+    created = store.create(
+        SOURCE,
+        "clash",
+        owner_token=owner,
+        network_identity="192.0.2.8",
+    )
+
+    assert store.enroll_admin_device(device, owner)
+    assert not store.enroll_admin_device("E" * 43, "P" * 43)
+    assert store.is_admin_device(device, owner)
+    assert not store.is_admin_device(device, "P" * 43)
+    restarted = _store(tmp_path / "links.sqlite3")
+    assert restarted.is_admin_device(device, owner)
+    overview = store.admin_overview()
+    assert overview.active == 1
+    assert overview.unique_users == 1
+    assert overview.unique_networks == 1
+    assert SOURCE not in repr(overview)
+    assert created.access_token not in repr(overview)
+    assert created.manage_key not in repr(overview)
+
+    csrf = store.admin_csrf_token(device)
+    assert store.verify_admin_csrf(device, csrf)
+    assert not store.verify_admin_csrf(device, "X" * 43)
+    assert store.admin_close(overview.links[0].link_ref) is not None
+    assert store.capacity().active == 0
+
+
+def test_schema_v1_is_upgraded_without_losing_existing_links(tmp_path: Path) -> None:
+    database = tmp_path / "links.sqlite3"
+    first = _store(database)
+    created = first.create(SOURCE, "clash")
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("DROP TABLE admin_device")
+        connection.execute("DROP TABLE link_ownership")
+        connection.execute("UPDATE metadata SET value = ? WHERE key = 'schema_version'", (b"1",))
+        connection.commit()
+
+    upgraded = _store(database)
+    assert upgraded.get(created.access_token) is not None
+    assert upgraded.admin_overview().unidentified_links == 1

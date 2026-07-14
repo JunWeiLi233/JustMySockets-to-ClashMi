@@ -30,9 +30,15 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
                 "PERSISTENT_LINKS_",
                 "LINK_",
                 "MAX_ACTIVE_LINKS",
-                "MAX_LINKS_PER_SOURCE",
+                "MAX_LINKS_",
                 "PUBLIC_BASE_URL",
                 "ALLOW_LEGACY_URL_ENDPOINTS",
+                "TRUSTED_CLIENT_IP_HEADER",
+                "CLIENT_COOKIE_",
+                "CHECK_RATE_",
+                "CREATE_RATE_",
+                "CLOSE_RATE_",
+                "ADMIN_",
             )
         ):
             monkeypatch.delenv(key, raising=False)
@@ -55,8 +61,12 @@ def test_defaults() -> None:
     assert s.link_secret_key == ""
     assert s.max_active_links == 100
     assert s.max_links_per_source == 3
+    assert s.max_links_per_user == 3
+    assert s.max_links_per_network == 10
     assert s.public_base_url == ""
     assert s.allow_legacy_url_endpoints is True
+    assert s.trusted_client_ip_header == ""
+    assert s.admin_bootstrap_secret == ""
 
 
 def test_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -71,8 +81,12 @@ def test_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LINK_SECRET_KEY", "private-value")
     monkeypatch.setenv("MAX_ACTIVE_LINKS", "42")
     monkeypatch.setenv("MAX_LINKS_PER_SOURCE", "2")
+    monkeypatch.setenv("MAX_LINKS_PER_USER", "4")
+    monkeypatch.setenv("MAX_LINKS_PER_NETWORK", "12")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://service.example/")
     monkeypatch.setenv("ALLOW_LEGACY_URL_ENDPOINTS", "false")
+    monkeypatch.setenv("TRUSTED_CLIENT_IP_HEADER", "X-Forwarded-For")
+    monkeypatch.setenv("ADMIN_BOOTSTRAP_SECRET", "admin-private-value")
     s = Settings()
     assert s.port == 9000
     assert s.cache_ttl_seconds == 120
@@ -85,9 +99,14 @@ def test_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.link_secret_key == "private-value"
     assert s.max_active_links == 42
     assert s.max_links_per_source == 2
+    assert s.max_links_per_user == 4
+    assert s.max_links_per_network == 12
     assert s.public_base_url == "https://service.example"
     assert s.allow_legacy_url_endpoints is False
+    assert s.trusted_client_ip_header == "X-Forwarded-For"
+    assert s.admin_bootstrap_secret == "admin-private-value"
     assert "private-value" not in repr(s)
+    assert "admin-private-value" not in repr(s)
 
 
 def test_invalid_int_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:

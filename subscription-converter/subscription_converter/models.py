@@ -11,9 +11,8 @@ Design notes
 - All models are Pydantic v2 ``BaseModel`` subclasses with ``model_config =
   extra="ignore"`` so that unknown fields encountered in real-world
   subscriptions do not cause validation failures (forward compatibility).
-- No model stores raw credentials in a way that would leak via ``repr``:
-  sensitive fields are not specially tagged here, but log masking is enforced
-  at the HTTP layer; models themselves are plain data carriers.
+- Credential fields are excluded from model ``repr`` output. Log masking is
+  separately enforced at the HTTP layer as defence in depth.
 - Frozen models are avoided so that parsers can normalise/populate derived
   fields after construction; immutability is enforced by convention, not type.
 """
@@ -87,8 +86,8 @@ class ProxyNode(BaseModel):
     port: int = Field(ge=1, le=65535)
 
     # credentials / params
-    password: str | None = None
-    uuid: str | None = None
+    password: str | None = Field(default=None, repr=False)
+    uuid: str | None = Field(default=None, repr=False)
     cipher: str | None = None  # ss / vmess
     alter_id: int = 0  # vmess
 
@@ -103,7 +102,7 @@ class ProxyNode(BaseModel):
 
     # hysteria2 / hysteria
     obfs: str | None = None
-    obfs_password: str | None = None
+    obfs_password: str | None = Field(default=None, repr=False)
     up: str | None = None
     down: str | None = None
 

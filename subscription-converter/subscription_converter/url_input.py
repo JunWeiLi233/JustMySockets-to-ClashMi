@@ -21,6 +21,7 @@ should fetch. It never logs the URL or its credentials.
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 __all__ = ["InvalidSubscriptionURL", "normalize_subscription_url"]
 
@@ -75,7 +76,14 @@ def normalize_subscription_url(raw: str) -> str:
             "url must start with http:// or https:// (after normalisation)"
         )
 
-    return text
+    parsed = urlsplit(text)
+    if not parsed.netloc:
+        raise InvalidSubscriptionURL("url must include a host")
+
+    # URL fragments are browser-local and are never sent to an upstream HTTP
+    # server. Dropping them prevents equivalent subscriptions from bypassing
+    # duplicate-source and cache limits by varying an irrelevant suffix.
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
 
 
 def _maybe_decode_once(text: str) -> str | None:
