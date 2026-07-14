@@ -20,7 +20,7 @@ from subscription_converter.url_input import (
 __all__ = ()
 
 CLEAN = (
-    "https://jmssub.net/members/getsub.php?service=1414611&id=40bbc229-71d4-4e65-a305-4505a27d249f"
+    "https://jmssub.net/members/getsub.php?service=123456&id=00000000-0000-4000-8000-000000000000"
 )
 
 
@@ -33,10 +33,10 @@ def test_clean_url_passes_through() -> None:
 
 def test_strips_stray_backslashes_before_punctuation() -> None:
     """The exact bug: shell-escaped '?', '=', '&', '/'."""
-    messy = r"https://jmssub.net/members/getsub.php\?service\=1414611\&id\=40bbc229"
+    messy = r"https://jmssub.net/members/getsub.php\?service\=123456\&id\=00000000"
     assert (
         normalize_subscription_url(messy)
-        == "https://jmssub.net/members/getsub.php?service=1414611&id=40bbc229"
+        == "https://jmssub.net/members/getsub.php?service=123456&id=00000000"
     )
 
 
@@ -49,8 +49,8 @@ def test_strips_leading_percent20_space() -> None:
 def test_decodes_pre_encoded_url_once() -> None:
     """User encoded the URL themselves; we undo exactly one layer."""
     encoded = (
-        "https%3A%2F%2Fjmssub.net%2Fmembers%2Fgetsub.php%3Fservice%3D1414611"
-        "%26id%3D40bbc229-71d4-4e65-a305-4505a27d249f"
+        "https%3A%2F%2Fjmssub.net%2Fmembers%2Fgetsub.php%3Fservice%3D123456"
+        "%26id%3D00000000-0000-4000-8000-000000000000"
     )
     assert normalize_subscription_url(encoded) == CLEAN
 
